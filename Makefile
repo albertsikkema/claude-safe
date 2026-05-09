@@ -56,10 +56,19 @@ build-server:
 clean-local:
 	docker rmi $(IMAGE)
 
+# Guard: ensure SERVER is a real host, not the placeholder default.
+check-server:
+	@if [ -z "$(SERVER)" ] || [ "$(SERVER)" = "<your-server>" ]; then \
+		echo "ERROR: SERVER not set." >&2; \
+		echo "  Pass it:   make $(MAKECMDGOALS) SERVER=your-host" >&2; \
+		echo "  Or export: export CLAUDE_SERVER_HOST=your-host && make $(MAKECMDGOALS) SERVER=\$$CLAUDE_SERVER_HOST" >&2; \
+		exit 1; \
+	fi
+
 # Remove the Docker image on the remote server. Does not affect credential volumes.
-clean-server:
+clean-server: check-server
 	ssh $(SERVER) "docker rmi $(IMAGE)"
 
 # List and remove all sessions (containers, workspaces, temp dirs) on the remote server.
-cleanup-server:
-	claude-server --cleanup-all
+cleanup-server: check-server
+	CLAUDE_SERVER_HOST=$(SERVER) claude-server --cleanup-all

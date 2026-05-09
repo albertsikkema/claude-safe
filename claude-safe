@@ -16,7 +16,7 @@
 #   claude-safe -- <claude-args>    # pass other args to claude
 #
 # Prerequisites:
-#   docker build -t claude-code-safe /path/to/this/directory
+#   Docker. The image auto-pulls from public GHCR on first run.
 #
 # First-time authentication:
 #   Run `claude-safe --shell` and then `claude` to authenticate via browser OAuth.
@@ -88,7 +88,6 @@ while [[ $# -gt 0 ]]; do
             echo "  --rebuild       Full image rebuild (uses \$CLAUDE_SAFE_DIR or ~/.config/claude-safe)"
             echo "  --pull          Pull latest nightly image from GHCR and retag as $IMAGE"
             echo "                    Source: \$CLAUDE_SAFE_REMOTE_IMAGE (default $IMAGE_REMOTE)"
-            echo "                    Requires 'gh auth login' or 'docker login ghcr.io' on the host"
             echo "  --no-image-check  Skip the once-per-day GHCR digest check (auto-pull)"
             echo "  --ssh [HOSTS]   Mount SSH config/keys for selected servers (read-only)"
             echo "                    No argument: interactive server picker"
@@ -521,9 +520,8 @@ select_ssh_hosts() {
 if $PULL; then
     echo "==> Pulling $IMAGE_REMOTE..."
     if ! docker pull "$IMAGE_REMOTE"; then
-        echo "ERROR: docker pull failed. For private GHCR packages, log in first:"
-        echo "  echo \$GH_TOKEN | docker login ghcr.io -u <github-username> --password-stdin"
-        echo "  (or 'gh auth token | docker login ghcr.io -u <github-username> --password-stdin')"
+        echo "ERROR: docker pull failed. Check network, then retry."
+        echo "  Or build locally: claude-safe --rebuild"
         exit 1
     fi
     docker tag "$IMAGE_REMOTE" "$IMAGE"
@@ -543,7 +541,7 @@ if ! docker image inspect "$IMAGE" &>/dev/null; then
         echo "==> Pulled and tagged $IMAGE."
     else
         echo "ERROR: Could not pull $IMAGE_REMOTE."
-        echo "  Check 'gh auth login' or 'docker login ghcr.io', then retry."
+        echo "  Check network, then retry."
         echo "  Or build locally: claude-safe --rebuild"
         exit 1
     fi

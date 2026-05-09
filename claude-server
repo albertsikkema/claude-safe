@@ -18,7 +18,7 @@
 #   claude-server --pull                     # pull latest nightly image from GHCR
 #
 # First-time setup:
-#   1. claude-server --rebuild              # build image on server
+#   1. claude-server --pull                 # pull image from public GHCR onto server
 #   2. claude-server --shell                # authenticate via browser OAuth
 #
 # Prerequisites:
@@ -216,8 +216,8 @@ cmd_rebuild() {
 cmd_pull() {
     echo "==> Pulling $IMAGE_REMOTE on $SERVER..."
     if ! ssh -t "${SSH_OPTS[@]}" "$SERVER" "docker pull '$IMAGE_REMOTE' && docker tag '$IMAGE_REMOTE' '$IMAGE'"; then
-        echo "ERROR: docker pull failed on $SERVER. For private GHCR, log in on the server:"
-        echo "  ssh $SERVER 'echo \$GH_TOKEN | docker login ghcr.io -u <github-username> --password-stdin'"
+        echo "ERROR: docker pull failed on $SERVER. Check network and retry,"
+        echo "  or build there: claude-server --rebuild"
         exit 1
     fi
     echo "==> Tagged $IMAGE_REMOTE as $IMAGE on $SERVER."
@@ -673,7 +673,7 @@ if ! ssh_cmd "docker image inspect $IMAGE" &>/dev/null; then
         echo "==> Pulled and tagged $IMAGE on $SERVER."
     else
         echo "ERROR: Could not pull $IMAGE_REMOTE on $SERVER."
-        echo "  Check 'docker login ghcr.io' on the server, then retry."
+        echo "  Check network on the server, then retry."
         echo "  Or build there: claude-server --rebuild"
         exit 1
     fi

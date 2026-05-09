@@ -241,7 +241,8 @@ NOW=$(date +%s)
 if [[ -f "$CHECK_FILE" ]]; then
     LAST=$(cat "$CHECK_FILE" 2>/dev/null || echo 0)
     if [[ -n "$LAST" ]] && [[ $(( NOW - LAST )) -lt 86400 ]]; then
-        echo "STATUS=throttled"
+        REMAINING=$(( 86400 - (NOW - LAST) ))
+        echo "STATUS=throttled:${REMAINING}"
         exit 0
     fi
 fi
@@ -296,10 +297,32 @@ REMOTE_SCRIPT
     status=$(echo "$result" | grep '^STATUS=' | tail -n1 | sed 's/^STATUS=//')
     case "$status" in
         updated:*)
-            echo "==> Auto-updated image on $SERVER (${status#updated:})"
+            echo "==> Auto-updated image on $SERVER (${status#updated:})."
             ;;
         pull-failed)
             echo "==> Auto-pull failed on $SERVER; using existing image."
+            ;;
+        throttled:*)
+            local rem="${status#throttled:}"
+            echo "==> Image-digest check throttled on $SERVER (next in $((rem / 3600))h$(((rem % 3600) / 60))m). Force: claude-server --pull"
+            ;;
+        current)
+            echo "==> Image on $SERVER current with GHCR."
+            ;;
+        diverged)
+            echo "==> Local 'claude-code-safe' on $SERVER differs from $IMAGE_REMOTE (built or retagged there); skipping auto-pull. Force: claude-server --pull"
+            ;;
+        no-remote-tag-locally)
+            echo "==> '$IMAGE_REMOTE' not present on $SERVER; will be pulled below if needed."
+            ;;
+        no-local-digest)
+            echo "==> Skipped image-digest check on $SERVER: no RepoDigest recorded for '$IMAGE_REMOTE'."
+            ;;
+        no-remote-digest)
+            echo "==> GHCR returned an empty digest for '$IMAGE_REMOTE'; using existing image on $SERVER."
+            ;;
+        remote-fail)
+            echo "==> Could not reach GHCR for digest check on $SERVER; using existing image."
             ;;
     esac
 }

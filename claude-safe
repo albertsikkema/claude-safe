@@ -199,6 +199,8 @@ check_remote_image_age() {
     if [[ -f "$check_file" ]]; then
         last=$(cat "$check_file" 2>/dev/null || echo 0)
         if [[ -n "$last" ]] && [[ $(( now - last )) -lt 86400 ]]; then
+            local rem=$(( 86400 - (now - last) ))
+            echo "==> Image-digest check throttled (next in $((rem / 3600))h$(((rem % 3600) / 60))m). Force: claude-safe --pull"
             return 0
         fi
     fi
@@ -206,13 +208,19 @@ check_remote_image_age() {
     echo "$now" > "$check_file"
 
     # Local IMAGE_REMOTE tag missing → image was built locally or never pulled
-    docker image inspect "$IMAGE_REMOTE" &>/dev/null || return 0
+    if ! docker image inspect "$IMAGE_REMOTE" &>/dev/null; then
+        echo "==> Skipped image-digest check: '$IMAGE_REMOTE' not present locally; will be pulled below if needed."
+        return 0
+    fi
 
     # If $IMAGE diverged from $IMAGE_REMOTE (user rebuilt locally), don't overwrite
     local image_id remote_image_id
     image_id=$(docker image inspect "$IMAGE" --format '{{.Id}}' 2>/dev/null || true)
     remote_image_id=$(docker image inspect "$IMAGE_REMOTE" --format '{{.Id}}' 2>/dev/null || true)
-    [[ -n "$image_id" && "$image_id" == "$remote_image_id" ]] || return 0
+    if [[ -z "$image_id" || "$image_id" != "$remote_image_id" ]]; then
+        echo "==> Local '$IMAGE' differs from '$IMAGE_REMOTE' (locally built or retagged); skipping auto-pull. Force: claude-safe --pull"
+        return 0
+    fi
 
     # Compare local RepoDigest vs upstream manifest digest
     local prefix="${IMAGE_REMOTE%:*}"
@@ -220,12 +228,24 @@ check_remote_image_age() {
     local_digest=$(docker image inspect "$IMAGE_REMOTE" \
         --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null \
         | grep "^${prefix}@" | head -n1 | awk -F@ '{print $2}')
-    [[ -n "$local_digest" ]] || return 0
+    if [[ -z "$local_digest" ]]; then
+        echo "==> Skipped image-digest check: no RepoDigest recorded locally for '$IMAGE_REMOTE'."
+        return 0
+    fi
 
-    remote_digest=$(docker buildx imagetools inspect "$IMAGE_REMOTE" \
-        --format '{{.Manifest.Digest}}' 2>/dev/null) || return 0
-    [[ -n "$remote_digest" ]] || return 0
-    [[ "$local_digest" != "$remote_digest" ]] || return 0
+    if ! remote_digest=$(docker buildx imagetools inspect "$IMAGE_REMOTE" \
+        --format '{{.Manifest.Digest}}' 2>/dev/null); then
+        echo "==> Could not reach GHCR for digest check; using existing image."
+        return 0
+    fi
+    if [[ -z "$remote_digest" ]]; then
+        echo "==> GHCR returned an empty digest; using existing image."
+        return 0
+    fi
+    if [[ "$local_digest" == "$remote_digest" ]]; then
+        echo "==> Image current with GHCR (${remote_digest:0:19})."
+        return 0
+    fi
 
     echo "==> New image on registry. Auto-pulling $IMAGE_REMOTE..."
     if docker pull "$IMAGE_REMOTE" >/dev/null 2>&1; then

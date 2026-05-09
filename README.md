@@ -228,6 +228,8 @@ The flags `-p`, `--output-format`, `--verbose`, `--max-turns`, and `--model` are
 | Host path | Container path | Type | Purpose |
 |---|---|---|---|
 | `$PWD` (or arg) | `/workspace` | bind mount | Your project files |
+| (none) | `/workspace/.venv` | tmpfs | Empty overlay, hides host venv (disable with `--keep-venv`) |
+| (none) | `/workspace/node_modules` | tmpfs | Empty overlay, hides host node_modules (disable with `--keep-venv`) |
 | `claude-code-credentials` | `/home/node/.claude` | Docker volume | Auth credentials (persisted) |
 | `~/.cache/uv` | `/home/node/.cache/uv` | bind mount | uv/uvx cache (MCP servers, packages) |
 | (env vars) | `GIT_AUTHOR_NAME`, etc. | environment | Git user identity (extracted from host `git config`) |
@@ -237,6 +239,8 @@ The flags `-p`, `--output-format`, `--verbose`, `--max-turns`, and `--model` are
 | `~/.azure` | `/home/node/.azure` | bind mount | Azure CLI credentials (with `--azure` flag) |
 | `~/.expo` | `/home/node/.expo` | bind mount | EAS CLI credentials (with `--expo` flag) |
 | `claude-code-history` | `/commandhistory` | Docker volume | Shell history (persisted) |
+
+**Why `.venv` and `node_modules` are masked.** The whole project is bind-mounted, so host directories are normally visible inside the container. A host-built `.venv/` (mach-o binaries on macOS) and host-built `node_modules/` (with native addons) can't run on Linux, and anything Claude does inside the container (`uv venv`, `npm install`, etc.) would write Linux artifacts back through the bind mount and corrupt the host copy. Empty tmpfs overlays at those two paths hide the host versions inside the container; the host directories are untouched. Pass `--keep-venv` to disable the masks (only safe when host and container share OS+arch).
 
 ---
 

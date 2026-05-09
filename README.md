@@ -262,26 +262,6 @@ If the bug is fixed upstream, the `mkdir`/`cd`/`rm` wrapper can be simplified to
 
 ---
 
-## Updating Claude Code
-
-The native installer includes automatic background updates ([docs](https://code.claude.com/docs/en/setup)). The wrapper script adds a staleness check on top of that:
-
-| Method | Command | What it does |
-|---|---|---|
-| Auto (default) | `claude-safe` | Checks image age. If ≥ 7 days, runs `claude update` at container startup |
-| Force | `claude-safe --update` | Always runs `claude update` regardless of age |
-| Skip | `claude-safe --no-update` | Bypasses the staleness check entirely |
-| Rebuild | `claude-safe --rebuild` | Runs `docker build --no-cache` — fresh base image, latest OS packages, fresh native install |
-| Pull | `claude-safe --pull` | Pulls the nightly image from GHCR and retags it as `claude-code-safe` (no local build) |
-
-For a full refresh (new Node base image, new OS packages, new Claude Code binary):
-
-```bash
-claude-safe --rebuild
-```
-
----
-
 ## Nightly builds (GHCR)
 
 `.github/workflows/nightly-build.yml` builds the image every night at 03:00 UTC

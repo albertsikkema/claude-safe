@@ -12,12 +12,6 @@ on:
   workflow_dispatch:
   push:
     branches: [main]
-    paths:
-      - Dockerfile
-      - init-firewall.sh
-      - .ripgreprc
-      - .rgignore
-      - .github/workflows/nightly-build.yml
 
 concurrency:
   group: nightly-build

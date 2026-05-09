@@ -131,6 +131,16 @@ claude-safe --pull
 claude-safe --help
 ```
 
+### Shell alias
+
+My day-to-day invocation skips the firewall, so I keep this in `~/.zshrc`:
+
+```bash
+alias cly='claude-safe --no-firewall'
+```
+
+The container is still isolated (filesystem, processes, package installs); only the outbound network restriction is dropped. Use the bare `claude-safe` when you want the firewall back on.
+
 ---
 
 ## Remote builds with `claude-server`

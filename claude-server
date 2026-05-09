@@ -258,7 +258,9 @@ set -u
 CACHE_DIR="$HOME/.cache/claude-safe"
 CHECK_FILE="$CACHE_DIR/last-image-check"
 NOW=$(date +%s)
-if [[ -f "$CHECK_FILE" ]]; then
+# Only honour throttle if the local image actually exists — if it's gone,
+# the cache file is stale and we must proceed (likely ending up at a pull).
+if [[ -f "$CHECK_FILE" ]] && docker image inspect "$IMAGE" &>/dev/null; then
     LAST=$(cat "$CHECK_FILE" 2>/dev/null || echo 0)
     if [[ -n "$LAST" ]] && [[ $(( NOW - LAST )) -lt 86400 ]]; then
         REMAINING=$(( 86400 - (NOW - LAST) ))
@@ -712,10 +714,11 @@ fi
 # ── Ensure image exists on server ─────────────────────────────────
 if ! ssh_cmd "docker image inspect $IMAGE" &>/dev/null; then
     echo "==> Image '$IMAGE' not found on $SERVER. Pulling $IMAGE_REMOTE..."
-    if ssh_cmd "docker pull '$IMAGE_REMOTE' >/dev/null 2>&1 && docker tag '$IMAGE_REMOTE' '$IMAGE'"; then
+    # --quiet silences per-layer progress but preserves the real error on failure
+    if ssh_cmd "docker pull --quiet '$IMAGE_REMOTE' >/dev/null && docker tag '$IMAGE_REMOTE' '$IMAGE'"; then
         echo "==> Pulled and tagged $IMAGE on $SERVER."
     else
-        echo "ERROR: Could not pull $IMAGE_REMOTE on $SERVER."
+        echo "ERROR: Could not pull $IMAGE_REMOTE on $SERVER. (See docker error above.)"
         echo "  Check network on the server, then retry."
         echo "  Or build there: claude-server --rebuild"
         exit 1

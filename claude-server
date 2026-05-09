@@ -1,0 +1,998 @@
+#!/bin/bash
+# claude-server: Run Claude Code on a remote server for persistent builds
+#
+# Like claude-safe, but runs on a remote server so builds survive laptop
+# sleep/disconnect. The container self-destructs when the build completes.
+#
+# Usage:
+#   claude-server -p "fix the bug"           # start build on server
+#   claude-server /path/to/project -p "..."  # specific project
+#   claude-server --shell                    # interactive zsh via tmux (detachable)
+#   claude-server --status                   # list running sessions
+#   claude-server --logs <session>           # follow session logs
+#   claude-server --sync <session>           # sync results back to local
+#   claude-server --stop <session>           # stop a session
+#   claude-server --attach <session>         # reattach to tmux session
+#   claude-server --cleanup <session>        # remove workspace from server
+#   claude-server --rebuild                  # build Docker image on server
+#   claude-server --pull                     # pull latest nightly image from GHCR
+#
+# First-time setup:
+#   1. claude-server --rebuild              # build image on server
+#   2. claude-server --shell                # authenticate via browser OAuth
+#
+# Prerequisites:
+#   - SSH access to the server (default: <your-server>, override with CLAUDE_SERVER_HOST)
+#   - Docker installed on the server
+
+set -euo pipefail
+
+# ── Configuration ─────────────────────────────────────────────────
+SERVER="${CLAUDE_SERVER_HOST:-<your-server>}"
+REMOTE_BASE="claude-server"  # relative to remote $HOME
+LOCAL_META_DIR="$HOME/.claude-server/sessions"
+IMAGE="claude-code-safe"
+IMAGE_REMOTE="${CLAUDE_SAFE_REMOTE_IMAGE:-ghcr.io/albertsikkema/claude-code-safe:latest}"
+STALE_DAYS=7
+CHECK_REMOTE_IMAGE=true  # auto-check GHCR for newer image once per day
+DOCKERFILE_DIR="${CLAUDE_SAFE_DIR:-$HOME/claude-safe}"
+CREDENTIALS_VOLUME="claude-code-credentials"
+HISTORY_VOLUME="claude-code-history"
+
+# Common rsync excludes for project sync
+RSYNC_EXCLUDES=(
+    --exclude='node_modules'
+    --exclude='.venv'
+    --exclude='venv'
+    --exclude='__pycache__'
+    --exclude='.mypy_cache'
+    --exclude='.next'
+    --exclude='dist'
+    --exclude='build'
+    --exclude='.claude-server.log'
+    --exclude='.entrypoint.sh'
+    --exclude='.launch.sh'
+)
+
+# ── SSH multiplexing ──────────────────────────────────────────────
+# Reuse a single SSH connection for all commands to avoid repeated MOTD banners
+SSH_CONTROL="/tmp/cs-ssh-control-$$"
+SSH_OPTS=(-o "ControlMaster=auto" -o "ControlPath=$SSH_CONTROL" -o "ControlPersist=60")
+
+# Wrapper: use for all non-interactive SSH commands
+ssh_cmd() { ssh "${SSH_OPTS[@]}" "$SERVER" "$@"; }
+
+# ── Subcommand functions ──────────────────────────────────────────
+cmd_status() {
+    echo "==> Sessions on $SERVER:"
+    echo ""
+    echo "Running containers:"
+    ssh_cmd "docker ps --filter 'name=cs-' --format 'table {{.Names}}\t{{.Status}}\t{{.RunningFor}}'" 2>/dev/null || echo "  (none)"
+    echo ""
+    echo "Tmux sessions:"
+    ssh_cmd "tmux ls 2>/dev/null" || echo "  (none)"
+    echo ""
+    echo "Workspaces:"
+    ssh_cmd "ls -1 ~/$REMOTE_BASE/ 2>/dev/null | grep -v '^\\.'" || echo "  (none)"
+}
+
+# Strip cs- prefix if user passes container name instead of session ID
+normalize_session() { local s="$1"; [[ "$s" == cs-* ]] && s="${s#cs-}"; echo "$s"; }
+
+cmd_logs() {
+    local session; session=$(normalize_session "${1:?Usage: claude-server --logs <session-id>}")
+    local container="cs-${session}"
+
+    # Check if container is running
+    if ssh_cmd "docker ps -q --filter name=^${container}$" 2>/dev/null | grep -q .; then
+        echo "==> Following logs for $container (Ctrl+C to detach)..."
+        ssh_cmd "docker logs -f $container"
+    else
+        echo "==> Container not running. Checking saved log..."
+        ssh_cmd "cat ~/$REMOTE_BASE/$session/.claude-server.log 2>/dev/null" || echo "No logs found for session: $session"
+    fi
+}
+
+cmd_sync() {
+    local session; session=$(normalize_session "${1:?Usage: claude-server --sync <session-id>}")
+    local meta_file="$LOCAL_META_DIR/$session"
+
+    if [[ ! -f "$meta_file" ]]; then
+        echo "ERROR: No local metadata for session: $session"
+        echo ""
+        echo "Known sessions:"
+        ls -1 "$LOCAL_META_DIR/" 2>/dev/null || echo "  (none)"
+        exit 1
+    fi
+
+    local local_dir
+    local_dir=$(cat "$meta_file")
+
+    # Check if container is still running
+    local container="cs-${session}"
+    if ssh_cmd "docker ps -q --filter name=^${container}$" 2>/dev/null | grep -q .; then
+        echo "WARNING: Container $container is still running. Syncing current state."
+        echo ""
+    fi
+
+    echo "==> Syncing $SERVER:~/$REMOTE_BASE/$session/ → $local_dir/"
+    rsync -avz "${RSYNC_EXCLUDES[@]}" \
+        "$SERVER:~/$REMOTE_BASE/$session/" "$local_dir/"
+    echo ""
+    echo "==> Sync complete. Review changes with:"
+    echo "    cd $local_dir && git diff"
+}
+
+cmd_stop() {
+    local session; session=$(normalize_session "${1:?Usage: claude-server --stop <session-id>}")
+    local container="cs-${session}"
+
+    echo "==> Stopping $container on $SERVER..."
+    ssh_cmd "docker stop $container 2>/dev/null" || echo "Container not running."
+    # Also kill tmux session if it exists
+    ssh_cmd "tmux kill-session -t cs-$session 2>/dev/null" || true
+}
+
+cmd_attach() {
+    local session; session=$(normalize_session "${1:?Usage: claude-server --attach <session-id>}")
+    echo "==> Attaching to tmux session cs-$session on $SERVER..."
+    echo "    (Detach with Ctrl+B, D)"
+    ssh -t "${SSH_OPTS[@]}" "$SERVER" "tmux attach -t cs-$session"
+}
+
+cmd_exec() {
+    local session; session=$(normalize_session "${1:?Usage: claude-server --exec <session-id>}")
+    local container="cs-${session}"
+    echo "==> Opening shell in container $container on $SERVER..."
+    echo "    (Exit with Ctrl+D or 'exit')"
+    ssh -t "${SSH_OPTS[@]}" "$SERVER" "docker exec -it -w /workspace $container zsh"
+}
+
+cmd_cleanup() {
+    local session; session=$(normalize_session "${1:?Usage: claude-server --cleanup <session-id>}")
+    local container="cs-${session}"
+
+    echo "==> Cleaning up session $session..."
+    ssh_cmd "docker stop $container 2>/dev/null; docker rm $container 2>/dev/null" || true
+    ssh_cmd "rm -rf ~/$REMOTE_BASE/$session /tmp/cs-ssh-$session /tmp/cs-azure-$session /tmp/cs-expo-$session /tmp/cs-gh-$session" || true
+    ssh_cmd "tmux kill-session -t cs-$session 2>/dev/null" || true
+    rm -f "$LOCAL_META_DIR/$session"
+    echo "==> Cleaned up."
+}
+
+cmd_cleanup_all() {
+    echo "==> Containers on $SERVER:"
+    echo ""
+    ssh_cmd "docker ps -a --filter 'name=cs-' --format 'table {{.Names}}\t{{.Status}}\t{{.RunningFor}}'" 2>/dev/null || true
+    echo ""
+    echo "==> Workspaces:"
+    ssh_cmd "ls -1 ~/$REMOTE_BASE/ 2>/dev/null | grep -v '^\\.'" || echo "  (none)"
+    echo ""
+    read -rp "Stop all containers and remove all workspaces? [y/N] " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        echo "Cancelled."
+        return
+    fi
+    echo ""
+    # Stop and remove all cs- containers
+    ssh_cmd "docker ps -aq --filter 'name=cs-' | xargs -r docker stop 2>/dev/null; docker ps -aq --filter 'name=cs-' | xargs -r docker rm 2>/dev/null" || true
+    # Kill all cs- tmux sessions
+    ssh_cmd "tmux ls -F '#{session_name}' 2>/dev/null | grep '^cs-' | xargs -I{} tmux kill-session -t {} 2>/dev/null" || true
+    # Remove all workspaces (but not .build/)
+    ssh_cmd "find ~/$REMOTE_BASE -maxdepth 1 -mindepth 1 -type d ! -name '.build' -exec rm -rf {} +" || true
+    # Remove all temp credential dirs
+    ssh_cmd "rm -rf /tmp/cs-ssh-* /tmp/cs-azure-* /tmp/cs-expo-* /tmp/cs-gh-*" || true
+    # Remove local metadata
+    rm -rf "$LOCAL_META_DIR"
+    mkdir -p "$LOCAL_META_DIR"
+    echo "==> All sessions cleaned up."
+}
+
+cmd_rebuild() {
+    echo "==> Syncing build context to $SERVER..."
+    ssh_cmd "mkdir -p ~/$REMOTE_BASE/.build"
+    rsync -az --delete \
+        --include='Dockerfile' \
+        --include='init-firewall.sh' \
+        --include='.rgignore' \
+        --include='.ripgreprc' \
+        --exclude='*' \
+        "$DOCKERFILE_DIR/" "$SERVER:~/$REMOTE_BASE/.build/"
+    echo "==> Building image on $SERVER (this may take a few minutes)..."
+    ssh -t "${SSH_OPTS[@]}" "$SERVER" "cd ~/$REMOTE_BASE/.build && docker build --no-cache --pull -t $IMAGE ."
+    echo "==> Build complete."
+}
+
+cmd_pull() {
+    echo "==> Pulling $IMAGE_REMOTE on $SERVER..."
+    if ! ssh -t "${SSH_OPTS[@]}" "$SERVER" "docker pull '$IMAGE_REMOTE' && docker tag '$IMAGE_REMOTE' '$IMAGE'"; then
+        echo "ERROR: docker pull failed on $SERVER. For private GHCR, log in on the server:"
+        echo "  ssh $SERVER 'echo \$GH_TOKEN | docker login ghcr.io -u <github-username> --password-stdin'"
+        exit 1
+    fi
+    echo "==> Tagged $IMAGE_REMOTE as $IMAGE on $SERVER."
+}
+
+# ── Auto-check GHCR for newer image (once per day, fail-open) ─────
+# Runs on the remote server via single ssh round-trip. Throttle file
+# lives on the remote at ~/.cache/claude-safe/last-image-check.
+check_remote_image_age() {
+    local tag="${IMAGE_REMOTE##*:}"
+    if [[ "$tag" =~ ^v[0-9] ]]; then
+        return 0
+    fi
+
+    local result
+    if ! result=$(ssh_cmd "IMAGE='$IMAGE' IMAGE_REMOTE='$IMAGE_REMOTE' bash -s" 2>&1 <<'REMOTE_SCRIPT'
+set -u
+CACHE_DIR="$HOME/.cache/claude-safe"
+CHECK_FILE="$CACHE_DIR/last-image-check"
+NOW=$(date +%s)
+if [[ -f "$CHECK_FILE" ]]; then
+    LAST=$(cat "$CHECK_FILE" 2>/dev/null || echo 0)
+    if [[ -n "$LAST" ]] && [[ $(( NOW - LAST )) -lt 86400 ]]; then
+        echo "STATUS=throttled"
+        exit 0
+    fi
+fi
+mkdir -p "$CACHE_DIR"
+echo "$NOW" > "$CHECK_FILE"
+
+if ! docker image inspect "$IMAGE_REMOTE" &>/dev/null; then
+    echo "STATUS=no-remote-tag-locally"
+    exit 0
+fi
+
+IMAGE_ID=$(docker image inspect "$IMAGE" --format '{{.Id}}' 2>/dev/null || true)
+REMOTE_IMAGE_ID=$(docker image inspect "$IMAGE_REMOTE" --format '{{.Id}}' 2>/dev/null || true)
+if [[ -z "$IMAGE_ID" || "$IMAGE_ID" != "$REMOTE_IMAGE_ID" ]]; then
+    echo "STATUS=diverged"
+    exit 0
+fi
+
+PREFIX="${IMAGE_REMOTE%:*}"
+LOCAL_DIGEST=$(docker image inspect "$IMAGE_REMOTE" \
+    --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null \
+    | grep "^${PREFIX}@" | head -n1 | awk -F@ '{print $2}')
+if [[ -z "$LOCAL_DIGEST" ]]; then
+    echo "STATUS=no-local-digest"
+    exit 0
+fi
+
+REMOTE_DIGEST=$(docker buildx imagetools inspect "$IMAGE_REMOTE" \
+    --format '{{.Manifest.Digest}}' 2>/dev/null) || { echo "STATUS=remote-fail"; exit 0; }
+if [[ -z "$REMOTE_DIGEST" ]]; then
+    echo "STATUS=no-remote-digest"
+    exit 0
+fi
+if [[ "$LOCAL_DIGEST" == "$REMOTE_DIGEST" ]]; then
+    echo "STATUS=current"
+    exit 0
+fi
+
+if docker pull "$IMAGE_REMOTE" >/dev/null 2>&1; then
+    docker tag "$IMAGE_REMOTE" "$IMAGE"
+    SHORT="${REMOTE_DIGEST#sha256:}"
+    echo "STATUS=updated:${SHORT:0:12}"
+else
+    echo "STATUS=pull-failed"
+fi
+REMOTE_SCRIPT
+); then
+        return 0
+    fi
+
+    local status
+    status=$(echo "$result" | grep '^STATUS=' | tail -n1 | sed 's/^STATUS=//')
+    case "$status" in
+        updated:*)
+            echo "==> Auto-updated image on $SERVER (${status#updated:})"
+            ;;
+        pull-failed)
+            echo "==> Auto-pull failed on $SERVER; using existing image."
+            ;;
+    esac
+}
+
+# ── Subcommand dispatch ───────────────────────────────────────────
+case "${1:-}" in
+    --status)  cmd_status; exit 0 ;;
+    --logs)    cmd_logs "${2:-}"; exit 0 ;;
+    --sync)    cmd_sync "${2:-}"; exit 0 ;;
+    --stop)    cmd_stop "${2:-}"; exit 0 ;;
+    --attach)  cmd_attach "${2:-}"; exit 0 ;;
+    --exec)    cmd_exec "${2:-}"; exit 0 ;;
+    --cleanup)     cmd_cleanup "${2:-}"; exit 0 ;;
+    --cleanup-all) cmd_cleanup_all; exit 0 ;;
+    --rebuild)     cmd_rebuild; exit 0 ;;
+    --pull)        cmd_pull; exit 0 ;;
+esac
+
+# ── Parse arguments ───────────────────────────────────────────────
+PROJECT_DIR=""
+SHELL_MODE=false
+FIREWALL=true
+UPDATE="auto"
+REBUILD=false
+MOUNT_SSH=false
+SSH_HOSTS=""
+SSH_TMPDIR=""
+MOUNT_AZURE=false
+MOUNT_EXPO=false
+MOUNT_GITHUB=false
+FOLLOW=false
+EXTRA_ARGS=()
+CLAUDE_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --shell)       SHELL_MODE=true; shift ;;
+        --no-firewall) FIREWALL=false; shift ;;
+        --update)      UPDATE="force"; shift ;;
+        --no-update)   UPDATE="skip"; shift ;;
+        --no-image-check) CHECK_REMOTE_IMAGE=false; shift ;;
+        --ssh)
+            MOUNT_SSH=true; shift
+            if [[ $# -gt 0 && "$1" != -* ]]; then
+                SSH_HOSTS="$1"; shift
+            fi
+            ;;
+        --azure)       MOUNT_AZURE=true; shift ;;
+        --expo)        MOUNT_EXPO=true; shift ;;
+        --github)      MOUNT_GITHUB=true; shift ;;
+        --follow)      FOLLOW=true; shift ;;
+        --server)      SERVER="$2"; shift 2 ;;
+        -p|--print)    CLAUDE_ARGS+=("$1" "$2"); shift 2 ;;
+        --output-format) CLAUDE_ARGS+=("$1" "$2"); shift 2 ;;
+        --verbose)     CLAUDE_ARGS+=("$1"); shift ;;
+        --max-turns)   CLAUDE_ARGS+=("$1" "$2"); shift 2 ;;
+        --model)       CLAUDE_ARGS+=("$1" "$2"); shift 2 ;;
+        --)            shift; CLAUDE_ARGS+=("$@"); break ;;
+        --help|-h)
+            echo "Usage: claude-server [OPTIONS] [PROJECT_DIR] [-- CLAUDE_ARGS...]"
+            echo ""
+            echo "Run Claude Code on a remote server. Builds survive laptop sleep/disconnect."
+            echo ""
+            echo "Session management:"
+            echo "  --status            List running sessions on server"
+            echo "  --logs <session>    Follow session logs (works during and after build)"
+            echo "  --sync <session>    Sync results back to local project directory"
+            echo "  --stop <session>    Stop a running session"
+            echo "  --attach <session>  Reattach to interactive/shell tmux session"
+            echo "  --cleanup <session> Remove session workspace from server"
+            echo "  --cleanup-all       List and remove ALL sessions from server"
+            echo "  --rebuild           Build/rebuild Docker image on server"
+            echo "  --pull              Pull latest nightly image from GHCR on server and retag"
+            echo ""
+            echo "Build options:"
+            echo "  --shell             Interactive zsh via tmux (detachable)"
+            echo "  --no-firewall       Skip network firewall"
+            echo "  --update            Force-update Claude Code at startup"
+            echo "  --no-update         Skip auto-update"
+            echo "  --no-image-check    Skip the once-per-day GHCR digest check (auto-pull)"
+            echo "  --follow            Follow logs after starting (Ctrl+C to detach)"
+            echo "  --server HOST       Override server (default: \$CLAUDE_SERVER_HOST or <your-server>)"
+            echo "  --ssh [HOSTS]       Copy SSH config/keys to server for container"
+            echo "  --azure             Copy ~/.azure to server for container"
+            echo "  --expo              Copy ~/.expo to server for container"
+            echo "  --github            Extract and pass GH_TOKEN"
+            echo "  -p 'prompt'         Non-interactive build (primary use case)"
+            echo "  -h, --help          Show this help"
+            echo ""
+            echo "Examples:"
+            echo "  claude-server -p 'fix the bug in main.py'       # start build"
+            echo "  claude-server --status                          # check progress"
+            echo "  claude-server --logs myproject-20260313-1430     # follow output"
+            echo "  claude-server --sync myproject-20260313-1430     # get results back"
+            echo "  claude-server --shell                            # interactive (detachable)"
+            echo "  claude-server --attach myproject-20260313-1430   # reattach to session"
+            echo ""
+            echo "Workflow:"
+            echo "  1. claude-server -p 'implement feature X'   # starts build, prints session ID"
+            echo "  2. Close laptop, go for coffee"
+            echo "  3. claude-server --status                   # check if done"
+            echo "  4. claude-server --sync <session-id>        # pull changes back"
+            exit 0
+            ;;
+        -*)         EXTRA_ARGS+=("$1"); shift ;;
+        *)          PROJECT_DIR="$1"; shift ;;
+    esac
+done
+
+PROJECT_DIR="${PROJECT_DIR:-$(pwd)}"
+PROJECT_DIR="$(cd "$PROJECT_DIR" && pwd)"
+
+PROJECT_NAME=$(basename "$PROJECT_DIR" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-')
+SESSION_ID="${PROJECT_NAME}-$(date +%Y%m%d-%H%M%S)"
+CONTAINER_NAME="cs-${SESSION_ID}"
+
+# ── Warn about existing sessions ──────────────────────────────────
+EXISTING_CONTAINERS=$(ssh_cmd "docker ps --filter 'name=cs-${PROJECT_NAME}-' --format '{{.Names}}'" 2>/dev/null || true)
+if [[ -n "$EXISTING_CONTAINERS" ]]; then
+    echo -e "==> \033[33mNote:\033[0m existing sessions for $PROJECT_NAME:"
+    while IFS= read -r c; do
+        echo "    ${c#cs-}"
+    done <<< "$EXISTING_CONTAINERS"
+    echo ""
+fi
+
+# ── Cleanup ───────────────────────────────────────────────────────
+cleanup() {
+    # Close SSH master connection
+    ssh -o "ControlPath=$SSH_CONTROL" -O exit "$SERVER" 2>/dev/null || true
+    if [[ -n "$SSH_TMPDIR" && -d "$SSH_TMPDIR" ]]; then
+        rm -rf "$SSH_TMPDIR"
+    fi
+}
+trap cleanup EXIT
+
+# ── SSH host selection (reused from claude-safe) ──────────────────
+SSH_DIR="$HOME/.ssh"
+
+select_ssh_hosts() {
+    local config_file="$SSH_DIR/config"
+
+    if [[ ! -f "$config_file" ]]; then
+        echo "ERROR: No SSH config found at $config_file"
+        exit 1
+    fi
+
+    if grep -qi '^[[:space:]]*Include ' "$config_file" 2>/dev/null; then
+        echo "WARNING: SSH config contains Include directives which are not followed."
+        echo ""
+    fi
+
+    local host_names=()
+    local host_hostnames=()
+    local host_users=()
+    local host_identityfiles=()
+    local host_blocks=()
+    local global_blocks=""
+
+    local current_name=""
+    local current_hostname=""
+    local current_user=""
+    local current_identityfiles=""
+    local current_block=""
+    local in_match=false
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// /}" ]] && continue
+
+        if [[ "$line" =~ ^[[:space:]]*Host[[:space:]]+(.*) ]]; then
+            local host_value="${BASH_REMATCH[1]}"
+            host_value="${host_value%%#*}"
+            host_value="${host_value%"${host_value##*[![:space:]]}"}"
+            in_match=false
+
+            if [[ -n "$current_name" ]]; then
+                if [[ "$current_name" == "*" ]]; then
+                    global_blocks+="$current_block"$'\n'
+                else
+                    host_names+=("$current_name")
+                    host_hostnames+=("$current_hostname")
+                    host_users+=("$current_user")
+                    host_identityfiles+=("$current_identityfiles")
+                    host_blocks+=("$current_block")
+                fi
+            fi
+
+            current_name="$host_value"
+            current_hostname=""
+            current_user=""
+            current_identityfiles=""
+            current_block="$line"$'\n'
+            continue
+        fi
+
+        if [[ "$line" =~ ^[[:space:]]*Match[[:space:]] ]]; then
+            if [[ -n "$current_name" ]]; then
+                if [[ "$current_name" == "*" ]]; then
+                    global_blocks+="$current_block"$'\n'
+                else
+                    host_names+=("$current_name")
+                    host_hostnames+=("$current_hostname")
+                    host_users+=("$current_user")
+                    host_identityfiles+=("$current_identityfiles")
+                    host_blocks+=("$current_block")
+                fi
+            fi
+            current_name=""
+            current_block=""
+            in_match=true
+            continue
+        fi
+
+        if $in_match; then
+            continue
+        fi
+
+        if [[ -n "$current_name" ]]; then
+            current_block+="$line"$'\n'
+            if [[ "$line" =~ ^[[:space:]]*HostName[[:space:]]+(.*) ]]; then
+                current_hostname="${BASH_REMATCH[1]}"
+                current_hostname="${current_hostname%%#*}"
+                current_hostname="${current_hostname%"${current_hostname##*[![:space:]]}"}"
+            fi
+            if [[ "$line" =~ ^[[:space:]]*User[[:space:]]+(.*) ]]; then
+                current_user="${BASH_REMATCH[1]}"
+                current_user="${current_user%%#*}"
+                current_user="${current_user%"${current_user##*[![:space:]]}"}"
+            fi
+            if [[ "$line" =~ ^[[:space:]]*IdentityFile[[:space:]]+(.*) ]]; then
+                local idfile="${BASH_REMATCH[1]}"
+                idfile="${idfile%%#*}"
+                idfile="${idfile%"${idfile##*[![:space:]]}"}"
+                if [[ -n "$current_identityfiles" ]]; then
+                    current_identityfiles+=":$idfile"
+                else
+                    current_identityfiles="$idfile"
+                fi
+            fi
+        fi
+    done < "$config_file"
+
+    if [[ -n "$current_name" ]]; then
+        if [[ "$current_name" == "*" ]]; then
+            global_blocks+="$current_block"$'\n'
+        else
+            host_names+=("$current_name")
+            host_hostnames+=("$current_hostname")
+            host_users+=("$current_user")
+            host_identityfiles+=("$current_identityfiles")
+            host_blocks+=("$current_block")
+        fi
+    fi
+
+    if [[ ${#host_names[@]} -eq 0 ]]; then
+        echo "ERROR: No Host entries found in $config_file"
+        exit 1
+    fi
+
+    # SSH hosts must be specified explicitly (no interactive picker for remote builds)
+    local selected_indices=()
+
+    if [[ -n "$SSH_HOSTS" ]]; then
+        local explicit_hosts
+        IFS=',' read -ra explicit_hosts <<< "$SSH_HOSTS"
+        for name in "${explicit_hosts[@]}"; do
+            local found=false
+            for i in "${!host_names[@]}"; do
+                if [[ "${host_names[$i]}" == "$name" ]]; then
+                    selected_indices+=("$i")
+                    found=true
+                    break
+                fi
+            done
+            if ! $found; then
+                echo "ERROR: SSH host not found in config: $name"
+                echo "Available hosts:"
+                for h in "${host_names[@]}"; do
+                    echo "  $h"
+                done
+                exit 1
+            fi
+        done
+    elif [[ ${#host_names[@]} -eq 1 ]]; then
+        selected_indices=(0)
+        echo "==> SSH: auto-selected ${host_names[0]} (only host available)"
+    else
+        echo "ERROR: --ssh requires explicit host names for remote builds"
+        echo "Available hosts:"
+        for h in "${host_names[@]}"; do
+            echo "  $h"
+        done
+        echo ""
+        echo "Usage: claude-server --ssh ${host_names[0]} -p 'your prompt'"
+        exit 1
+    fi
+
+    SSH_TMPDIR=$(mktemp -d)
+    local config_content=""
+    if [[ -n "$global_blocks" ]]; then
+        config_content+="$global_blocks"
+    fi
+
+    local copied_keys=()
+    local selected_host_names=()
+
+    for idx in "${selected_indices[@]}"; do
+        selected_host_names+=("${host_names[$idx]}")
+        config_content+="${host_blocks[$idx]}"$'\n'
+
+        if [[ -n "${host_identityfiles[$idx]}" ]]; then
+            IFS=':' read -ra idfiles <<< "${host_identityfiles[$idx]}"
+            for idfile in "${idfiles[@]}"; do
+                idfile="${idfile/#\~/$HOME}"
+                local already_copied=false
+                for ck in "${copied_keys[@]+"${copied_keys[@]}"}"; do
+                    if [[ "$ck" == "$idfile" ]]; then
+                        already_copied=true
+                        break
+                    fi
+                done
+                if $already_copied; then continue; fi
+
+                if [[ -f "$idfile" ]]; then
+                    local keybase
+                    keybase=$(basename "$idfile")
+                    cp "$idfile" "$SSH_TMPDIR/$keybase"
+                    chmod 600 "$SSH_TMPDIR/$keybase"
+                    copied_keys+=("$idfile")
+                    if [[ -f "${idfile}.pub" ]]; then
+                        cp "${idfile}.pub" "$SSH_TMPDIR/${keybase}.pub"
+                        chmod 644 "$SSH_TMPDIR/${keybase}.pub"
+                    fi
+                fi
+            done
+        fi
+    done
+
+    printf '%s' "$config_content" > "$SSH_TMPDIR/config"
+    chmod 644 "$SSH_TMPDIR/config"
+
+    if [[ -f "$SSH_DIR/known_hosts" ]]; then
+        cp "$SSH_DIR/known_hosts" "$SSH_TMPDIR/known_hosts"
+        chmod 644 "$SSH_TMPDIR/known_hosts"
+    fi
+
+    echo "==> SSH: server(s): ${selected_host_names[*]} (${#copied_keys[@]} key(s) copied)"
+}
+
+# ── Determine if interactive ──────────────────────────────────────
+INTERACTIVE=true
+PROMPT_TEXT=""
+if [[ ${#CLAUDE_ARGS[@]} -gt 0 ]]; then
+    for i in "${!CLAUDE_ARGS[@]}"; do
+        if [[ "${CLAUDE_ARGS[$i]}" == "-p" || "${CLAUDE_ARGS[$i]}" == "--print" ]]; then
+            INTERACTIVE=false
+            NEXT=$((i + 1))
+            if [[ -n "${CLAUDE_ARGS[$NEXT]+x}" ]]; then
+                PROMPT_TEXT="${CLAUDE_ARGS[$NEXT]}"
+            fi
+            break
+        fi
+    done
+fi
+
+# ── Auto-check for newer image once per day ───────────────────────
+if $CHECK_REMOTE_IMAGE; then
+    check_remote_image_age
+fi
+
+# ── Ensure image exists on server ─────────────────────────────────
+if ! ssh_cmd "docker image inspect $IMAGE" &>/dev/null; then
+    echo "==> Image '$IMAGE' not found on $SERVER. Pulling $IMAGE_REMOTE..."
+    if ssh_cmd "docker pull '$IMAGE_REMOTE' >/dev/null 2>&1 && docker tag '$IMAGE_REMOTE' '$IMAGE'"; then
+        echo "==> Pulled and tagged $IMAGE on $SERVER."
+    else
+        echo "ERROR: Could not pull $IMAGE_REMOTE on $SERVER."
+        echo "  Check 'docker login ghcr.io' on the server, then retry."
+        echo "  Or build there: claude-server --rebuild"
+        exit 1
+    fi
+fi
+
+# ── Determine if update is needed ─────────────────────────────────
+DO_UPDATE=false
+if [[ "$UPDATE" == "force" ]]; then
+    DO_UPDATE=true
+elif [[ "$UPDATE" == "auto" ]]; then
+    CREATED=$(ssh_cmd "docker image inspect $IMAGE --format '{{.Created}}'" 2>/dev/null || echo "")
+    if [[ -n "$CREATED" ]]; then
+        # Use GNU date on the remote server (Linux)
+        CREATED_EPOCH=$(ssh_cmd "date -d '$CREATED' +%s" 2>/dev/null || echo "0")
+        NOW_EPOCH=$(ssh_cmd "date +%s" 2>/dev/null || echo "0")
+        if [[ "$CREATED_EPOCH" != "0" && "$NOW_EPOCH" != "0" ]]; then
+            AGE_DAYS=$(( (NOW_EPOCH - CREATED_EPOCH) / 86400 ))
+            if [[ $AGE_DAYS -ge $STALE_DAYS ]]; then
+                echo "==> Image is ${AGE_DAYS} days old (threshold: ${STALE_DAYS}). Auto-updating Claude Code..."
+                DO_UPDATE=true
+            fi
+        fi
+    fi
+fi
+
+# ── Select SSH hosts if requested ─────────────────────────────────
+if $MOUNT_SSH; then
+    if [[ ! -d "$SSH_DIR" ]]; then
+        echo "ERROR: SSH directory not found: $SSH_DIR"
+        exit 1
+    fi
+    select_ssh_hosts
+fi
+
+# ── Extract host credentials ──────────────────────────────────────
+GIT_USER_NAME=$(git config user.name 2>/dev/null || true)
+GIT_USER_EMAIL=$(git config user.email 2>/dev/null || true)
+
+GH_TOKEN_VALUE=""
+if $MOUNT_GITHUB; then
+    GH_TOKEN_VALUE=$(gh auth token 2>/dev/null || true)
+    if [[ -z "$GH_TOKEN_VALUE" ]]; then
+        echo "WARNING: --github flag used but could not extract GitHub token."
+    fi
+fi
+
+# ── Sync project to server ────────────────────────────────────────
+REMOTE_DIR="$REMOTE_BASE/$SESSION_ID"
+
+echo "==> Syncing project to $SERVER:~/$REMOTE_DIR/..."
+ssh_cmd "mkdir -p ~/$REMOTE_DIR"
+rsync -az --delete "${RSYNC_EXCLUDES[@]}" -e "ssh ${SSH_OPTS[*]}" \
+    "$PROJECT_DIR/" "$SERVER:~/$REMOTE_DIR/"
+
+# ── Copy credentials to server if needed ──────────────────────────
+REMOTE_SSH_DIR=""
+if $MOUNT_SSH && [[ -n "$SSH_TMPDIR" ]]; then
+    REMOTE_SSH_DIR="/tmp/cs-ssh-$SESSION_ID"
+    ssh_cmd "mkdir -p $REMOTE_SSH_DIR && chmod 700 $REMOTE_SSH_DIR"
+    rsync -az -e "ssh ${SSH_OPTS[*]}" "$SSH_TMPDIR/" "$SERVER:$REMOTE_SSH_DIR/"
+    ssh_cmd "chmod 700 $REMOTE_SSH_DIR && chmod 600 $REMOTE_SSH_DIR/*"
+    echo "==> SSH keys copied to server"
+fi
+
+REMOTE_AZURE_DIR=""
+if $MOUNT_AZURE; then
+    if [[ -d "$AZURE_DIR" ]]; then
+        REMOTE_AZURE_DIR="/tmp/cs-azure-$SESSION_ID"
+        ssh_cmd "mkdir -p $REMOTE_AZURE_DIR"
+        rsync -az -e "ssh ${SSH_OPTS[*]}" "$AZURE_DIR/" "$SERVER:$REMOTE_AZURE_DIR/"
+        echo "==> Azure credentials copied to server"
+    else
+        echo "WARNING: Azure directory not found: $AZURE_DIR"
+    fi
+fi
+
+REMOTE_EXPO_DIR=""
+if $MOUNT_EXPO; then
+    if [[ -d "$EXPO_DIR" ]]; then
+        REMOTE_EXPO_DIR="/tmp/cs-expo-$SESSION_ID"
+        ssh_cmd "mkdir -p $REMOTE_EXPO_DIR"
+        rsync -az -e "ssh ${SSH_OPTS[*]}" "$EXPO_DIR/" "$SERVER:$REMOTE_EXPO_DIR/"
+        echo "==> Expo credentials copied to server"
+    else
+        echo "WARNING: Expo directory not found: $EXPO_DIR"
+    fi
+fi
+
+REMOTE_GH_DIR=""
+if $MOUNT_GITHUB; then
+    if [[ -d "$HOME/.config/gh" ]]; then
+        REMOTE_GH_DIR="/tmp/cs-gh-$SESSION_ID"
+        ssh_cmd "mkdir -p $REMOTE_GH_DIR"
+        rsync -az -e "ssh ${SSH_OPTS[*]}" "$HOME/.config/gh/" "$SERVER:$REMOTE_GH_DIR/"
+        echo "==> GitHub CLI config copied to server"
+    fi
+fi
+
+# ── Generate entrypoint script ────────────────────────────────────
+ENTRYPOINT_LINES=()
+ENTRYPOINT_LINES+=('#!/bin/bash')
+ENTRYPOINT_LINES+=('set -e')
+
+# Source GH_TOKEN from .env if present
+ENTRYPOINT_LINES+=('if [ -f /workspace/.env ]; then set -a; . /workspace/.env; set +a; fi')
+
+# Firewall
+if $FIREWALL; then
+    # Pass JIRA_URL through sudo so init-firewall.sh can whitelist the tenant.
+    ENTRYPOINT_LINES+=('sudo JIRA_URL="${JIRA_URL:-}" /usr/local/bin/init-firewall.sh 2>/dev/null || true')
+fi
+
+# Update
+if $DO_UPDATE; then
+    ENTRYPOINT_LINES+=("echo '==> Updating Claude Code...' && claude update 2>/dev/null && echo '==> Updated to:' && claude --version 2>/dev/null || true")
+fi
+
+# Main command
+if $SHELL_MODE; then
+    ENTRYPOINT_LINES+=('exec zsh')
+else
+    CLAUDE_CMD="claude --dangerously-skip-permissions"
+    if [[ ${#CLAUDE_ARGS[@]} -gt 0 ]]; then
+        for arg in "${CLAUDE_ARGS[@]}"; do
+            CLAUDE_CMD+=" $(printf '%q' "$arg")"
+        done
+    fi
+    if $INTERACTIVE; then
+        ENTRYPOINT_LINES+=("$CLAUDE_CMD || true")
+        ENTRYPOINT_LINES+=('exit 0')
+    else
+        # Non-interactive: tee output to log file for later retrieval
+        ENTRYPOINT_LINES+=("$CLAUDE_CMD 2>&1 | tee /workspace/.claude-server.log; exit \${PIPESTATUS[0]}")
+    fi
+fi
+
+# Write entrypoint to server
+ENTRYPOINT_CONTENT=$(printf '%s\n' "${ENTRYPOINT_LINES[@]}")
+ssh_cmd "cat > ~/$REMOTE_DIR/.entrypoint.sh && chmod +x ~/$REMOTE_DIR/.entrypoint.sh" <<< "$ENTRYPOINT_CONTENT"
+
+# ── Generate docker run command ───────────────────────────────────
+# Build the docker command as a script on the server to avoid SSH quoting issues.
+# All lines use double quotes so \\ consistently produces a single \ for continuation.
+DOCKER_LINES=()
+DOCKER_LINES+=("#!/bin/bash")
+DOCKER_LINES+=("set -e")
+
+if $INTERACTIVE || $SHELL_MODE; then
+    DOCKER_LINES+=("docker run -it --rm \\")
+else
+    DOCKER_LINES+=("docker run -d --rm \\")
+fi
+
+DOCKER_LINES+=("    --name \"$CONTAINER_NAME\" \\")
+DOCKER_LINES+=("    --cap-add=NET_ADMIN \\")
+DOCKER_LINES+=("    --cap-add=NET_RAW \\")
+DOCKER_LINES+=("    -v \"\$HOME/$REMOTE_DIR:/workspace\" \\")
+DOCKER_LINES+=("    -v \"$CREDENTIALS_VOLUME:/home/node/.claude\" \\")
+DOCKER_LINES+=("    -v \"$HISTORY_VOLUME:/commandhistory\" \\")
+DOCKER_LINES+=("    -e \"CLAUDE_CONFIG_DIR=/home/node/.claude\" \\")
+DOCKER_LINES+=("    -e \"NODE_OPTIONS=--max-old-space-size=4096\" \\")
+DOCKER_LINES+=("    -e \"CLAUDE_CONTAINER_MODE=1\" \\")
+DOCKER_LINES+=("    -e \"CLAUDE_CODE_ENABLE_RIPGREP=0\" \\")
+DOCKER_LINES+=("    -e \"CLAUDE_AUDIO_ENABLED=1\" \\")
+
+# Git identity
+if [[ -n "$GIT_USER_NAME" ]]; then
+    DOCKER_LINES+=("    -e \"GIT_AUTHOR_NAME=$GIT_USER_NAME\" \\")
+    DOCKER_LINES+=("    -e \"GIT_COMMITTER_NAME=$GIT_USER_NAME\" \\")
+fi
+if [[ -n "$GIT_USER_EMAIL" ]]; then
+    DOCKER_LINES+=("    -e \"GIT_AUTHOR_EMAIL=$GIT_USER_EMAIL\" \\")
+    DOCKER_LINES+=("    -e \"GIT_COMMITTER_EMAIL=$GIT_USER_EMAIL\" \\")
+fi
+
+# GitHub token
+if [[ -n "$GH_TOKEN_VALUE" ]]; then
+    DOCKER_LINES+=("    -e \"GH_TOKEN=$GH_TOKEN_VALUE\" \\")
+fi
+
+# MCP server API keys
+if [[ -n "${CONTEXT7_API_KEY:-}" ]]; then
+    DOCKER_LINES+=("    -e \"CONTEXT7_API_KEY=$CONTEXT7_API_KEY\" \\")
+fi
+if [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]]; then
+    DOCKER_LINES+=("    -e \"TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN\" \\")
+fi
+if [[ -n "${TELEGRAM_CHAT_ID:-}" ]]; then
+    DOCKER_LINES+=("    -e \"TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID\" \\")
+fi
+# mcp-atlassian: Jira credentials
+if [[ -n "${JIRA_URL:-}" ]]; then
+    DOCKER_LINES+=("    -e \"JIRA_URL=$JIRA_URL\" \\")
+fi
+if [[ -n "${JIRA_USERNAME:-}" ]]; then
+    DOCKER_LINES+=("    -e \"JIRA_USERNAME=$JIRA_USERNAME\" \\")
+fi
+if [[ -n "${JIRA_API_TOKEN:-}" ]]; then
+    DOCKER_LINES+=("    -e \"JIRA_API_TOKEN=$JIRA_API_TOKEN\" \\")
+fi
+if [[ -n "${JIRA_PROJECTS_FILTER:-}" ]]; then
+    DOCKER_LINES+=("    -e \"JIRA_PROJECTS_FILTER=$JIRA_PROJECTS_FILTER\" \\")
+fi
+
+# SSH mount
+if [[ -n "$REMOTE_SSH_DIR" ]]; then
+    DOCKER_LINES+=("    -v \"$REMOTE_SSH_DIR:/home/node/.ssh:ro\" \\")
+fi
+
+# GitHub CLI config mount
+if [[ -n "$REMOTE_GH_DIR" ]]; then
+    DOCKER_LINES+=("    -v \"$REMOTE_GH_DIR:/home/node/.config/gh:ro\" \\")
+fi
+
+# Azure CLI credentials mount
+if [[ -n "$REMOTE_AZURE_DIR" ]]; then
+    DOCKER_LINES+=("    -v \"$REMOTE_AZURE_DIR:/home/node/.azure\" \\")
+fi
+
+# Expo/EAS CLI credentials mount
+if [[ -n "$REMOTE_EXPO_DIR" ]]; then
+    DOCKER_LINES+=("    -v \"$REMOTE_EXPO_DIR:/home/node/.expo\" \\")
+fi
+
+# uv cache (server-local, persists across sessions)
+DOCKER_LINES+=("    -v \"\$HOME/.cache/uv:/home/node/.cache/uv\" \\")
+
+# Working directory
+DOCKER_LINES+=("    -w \"/workspace\" \\")
+
+# Image and command
+DOCKER_LINES+=("    \"$IMAGE\" \\")
+DOCKER_LINES+=("    bash /workspace/.entrypoint.sh")
+
+LAUNCH_CONTENT=$(printf '%s\n' "${DOCKER_LINES[@]}")
+ssh_cmd "cat > ~/$REMOTE_DIR/.launch.sh && chmod +x ~/$REMOTE_DIR/.launch.sh" <<< "$LAUNCH_CONTENT"
+
+# ── Save session metadata locally ─────────────────────────────────
+mkdir -p "$LOCAL_META_DIR"
+echo "$PROJECT_DIR" > "$LOCAL_META_DIR/$SESSION_ID"
+
+# ── Status display ────────────────────────────────────────────────
+echo ""
+echo "==> Project:     $PROJECT_DIR"
+GIT_BRANCH=$(git -C "$PROJECT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+if [[ -n "$GIT_BRANCH" ]]; then
+    if [[ "$GIT_BRANCH" == "main" || "$GIT_BRANCH" == "master" ]]; then
+        echo -e "==> Branch:      \033[33m$GIT_BRANCH\033[0m"
+    else
+        echo "==> Branch:      $GIT_BRANCH"
+    fi
+fi
+if [[ -n "$PROMPT_TEXT" ]]; then
+    TRUNCATED="${PROMPT_TEXT:0:50}"
+    if [[ ${#PROMPT_TEXT} -gt 50 ]]; then
+        TRUNCATED+="…"
+    fi
+    echo "==> Prompt:      $TRUNCATED"
+fi
+echo "==> Server:      $SERVER"
+echo "==> Session:     $SESSION_ID"
+echo "==> Container:   $CONTAINER_NAME"
+if [[ -n "$GIT_USER_NAME" ]]; then
+    echo "==> Git:         $GIT_USER_NAME <$GIT_USER_EMAIL>"
+fi
+if [[ -n "$GH_TOKEN_VALUE" ]]; then
+    echo "==> GitHub:      token from host (--github)"
+elif [[ -f "$PROJECT_DIR/.env" ]] && grep -qE "^GH_TOKEN=" "$PROJECT_DIR/.env" 2>/dev/null; then
+    echo "==> GitHub:      token will be loaded from .env"
+else
+    echo -e "==> GitHub:      \033[31mno token (use --github or add GH_TOKEN to .env)\033[0m"
+fi
+echo "==> Auth:        $CREDENTIALS_VOLUME (Docker volume on $SERVER)"
+echo -e "==> Permissions: \033[33m--dangerously-skip-permissions\033[0m (container isolation)"
+if [[ -n "$REMOTE_SSH_DIR" ]]; then
+    echo "==> SSH:         mounted (keys copied to server)"
+else
+    echo "==> SSH:         false"
+fi
+echo "==> Firewall:    $FIREWALL"
+echo "==> Update:      $UPDATE (will update: $DO_UPDATE)"
+echo ""
+
+# ── Launch ────────────────────────────────────────────────────────
+if $INTERACTIVE || $SHELL_MODE; then
+    # Interactive/shell: wrap in tmux for detachability
+    echo ""
+    echo -e "==> Starting interactive session in tmux (detach: \033[1;33mCtrl+B\033[0m, then \033[1;33mD\033[0m)"
+    echo -e "==> Reattach later: \033[1;36mclaude-server --attach $SESSION_ID\033[0m"
+    echo ""
+    TMUX_SESSION="cs-$SESSION_ID"
+    # Create detached tmux session, configure status bar, then attach
+    ssh_cmd "tmux new-session -d -s $TMUX_SESSION 'bash ~/$REMOTE_DIR/.launch.sh || { echo \"==> Docker exited with code \\\$?\"; read -p \"Press Enter to close...\"; }'" \
+        && ssh_cmd "tmux set -t $TMUX_SESSION status on" \
+        && ssh_cmd "tmux set -t $TMUX_SESSION status-style 'bg=colour25,fg=colour255'" \
+        && ssh_cmd "tmux set -t $TMUX_SESSION status-left ' Detach: Ctrl+B, D  |  '" \
+        && ssh_cmd "tmux set -t $TMUX_SESSION status-left-length 30" \
+        && ssh_cmd "tmux set -t $TMUX_SESSION status-right '  claude-server --attach $SESSION_ID '" \
+        && ssh_cmd "tmux set -t $TMUX_SESSION status-right-length 80"
+    ssh -t "${SSH_OPTS[@]}" "$SERVER" "tmux attach -t $TMUX_SESSION"
+    # After detach/disconnect: reprint session info so user can see it
+    echo ""
+    echo "==> Session:     $SESSION_ID"
+    echo "==> Container:   $CONTAINER_NAME"
+    echo ""
+    echo -e "Reattach: \033[1;36mclaude-server --attach $SESSION_ID\033[0m"
+    echo -e "Sync:     \033[1;36mclaude-server --sync $SESSION_ID\033[0m"
+    echo -e "Logs:     \033[1;36mclaude-server --logs $SESSION_ID\033[0m"
+    echo -e "Stop:     \033[1;36mclaude-server --stop $SESSION_ID\033[0m"
+else
+    # Non-interactive: start detached container
+    echo "==> Starting detached build..."
+    CONTAINER_ID=$(ssh_cmd "bash ~/$REMOTE_DIR/.launch.sh")
+    echo "==> Container started: ${CONTAINER_ID:0:12}"
+    echo ""
+    echo -e "Monitor:  \033[1;36mclaude-server --logs $SESSION_ID\033[0m"
+    echo -e "Status:   \033[1;36mclaude-server --status\033[0m"
+    echo -e "Sync:     \033[1;36mclaude-server --sync $SESSION_ID\033[0m"
+    echo -e "Stop:     \033[1;36mclaude-server --stop $SESSION_ID\033[0m"
+    echo -e "Cleanup:  \033[1;36mclaude-server --cleanup $SESSION_ID\033[0m"
+
+    if $FOLLOW; then
+        echo ""
+        echo "==> Following logs (Ctrl+C to detach, build continues on server)..."
+        ssh_cmd "docker logs -f $CONTAINER_NAME" || true
+    fi
+fi

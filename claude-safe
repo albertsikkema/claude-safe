@@ -1,0 +1,912 @@
+#!/bin/bash
+# claude-safe: Run Claude Code in an isolated container against your current directory
+#
+# Usage:
+#   claude-safe                     # mount $PWD, launch Claude (skip-permissions mode)
+#   claude-safe /path/to/project    # mount a specific directory
+#   claude-safe --shell             # drop into zsh instead of Claude
+#   claude-safe --no-firewall       # skip firewall setup (faster start)
+#   claude-safe --ssh               # interactive SSH server picker
+#   claude-safe --ssh myserver      # mount SSH config/keys for specific server(s)
+#   claude-safe --azure             # mount ~/.azure for Azure CLI credentials
+#   claude-safe --expo              # mount ~/.expo for EAS CLI credentials
+#   claude-safe --update            # force update Claude Code before launching
+#   claude-safe --rebuild           # full image rebuild (--no-cache)
+#   claude-safe --pull              # pull latest nightly image from GHCR and retag
+#   claude-safe -p "prompt"         # non-interactive mode with prompt
+#   claude-safe -- <claude-args>    # pass other args to claude
+#
+# Auto-update: If the image is older than 7 days, Claude Code is updated
+# inside the container at startup. Use --no-update to skip this.
+#
+# Prerequisites:
+#   docker build -t claude-code-safe /path/to/this/directory
+#
+# First-time authentication:
+#   Run `claude-safe --shell` and then `claude` to authenticate via browser OAuth.
+#   Credentials are stored in a Docker volume and persist across container restarts.
+
+set -euo pipefail
+
+IMAGE="claude-code-safe"
+IMAGE_REMOTE="${CLAUDE_SAFE_REMOTE_IMAGE:-ghcr.io/albertsikkema/claude-code-safe:latest}"
+SSH_DIR="$HOME/.ssh"
+AZURE_DIR="$HOME/.azure"
+EXPO_DIR="$HOME/.expo"
+LOGBENCH_BIN="$HOME/.local/bin/logbench-linux-arm64"
+LOGBENCH_CONFIG="$HOME/.config/logbench/config.yaml"
+HISTORY_VOLUME="claude-code-history"
+CREDENTIALS_VOLUME="claude-code-credentials"
+GIT_USER_NAME=""    # git user identity (extracted from host config)
+GIT_USER_EMAIL=""   # git user email (extracted from host config)
+STALE_DAYS=7  # auto-update if image older than this
+CHECK_REMOTE_IMAGE=true  # auto-check GHCR for newer image once per day
+
+# Directory containing Dockerfile (override with CLAUDE_SAFE_DIR env var)
+DOCKERFILE_DIR="${CLAUDE_SAFE_DIR:-$HOME/claude-safe}"
+
+# ── Parse arguments ────────────────────────────────────────────────
+PROJECT_DIR=""
+SHELL_MODE=false
+FIREWALL=true
+UPDATE="auto"  # "auto" | "force" | "skip"
+REBUILD=false
+PULL=false
+MOUNT_SSH=false
+SSH_HOSTS=""        # comma-separated host names (empty = interactive picker)
+SSH_TMPDIR=""      # temp directory for selected keys (cleaned up on exit)
+MOUNT_AZURE=false
+MOUNT_EXPO=false
+MOUNT_GITHUB=false
+MOUNT_LOGBENCH=true
+EXTRA_ARGS=()
+CLAUDE_ARGS=()
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --shell)       SHELL_MODE=true; shift ;;
+        --no-firewall) FIREWALL=false; shift ;;
+        --update)      UPDATE="force"; shift ;;
+        --no-update)   UPDATE="skip"; shift ;;
+        --rebuild)     REBUILD=true; shift ;;
+        --pull)        PULL=true; shift ;;
+        --no-image-check) CHECK_REMOTE_IMAGE=false; shift ;;
+        --ssh)
+            MOUNT_SSH=true; shift
+            if [[ $# -gt 0 && "$1" != -* ]]; then
+                SSH_HOSTS="$1"; shift
+            fi
+            ;;
+        --azure)       MOUNT_AZURE=true; shift ;;
+        --expo)        MOUNT_EXPO=true; shift ;;
+        --github)      MOUNT_GITHUB=true; shift ;;
+        --no-logbench) MOUNT_LOGBENCH=false; shift ;;
+        -p|--print)    CLAUDE_ARGS+=("$1" "$2"); shift 2 ;;
+        --output-format) CLAUDE_ARGS+=("$1" "$2"); shift 2 ;;
+        --verbose)     CLAUDE_ARGS+=("$1"); shift ;;
+        --max-turns)   CLAUDE_ARGS+=("$1" "$2"); shift 2 ;;
+        --model)       CLAUDE_ARGS+=("$1" "$2"); shift 2 ;;
+        --)            shift; CLAUDE_ARGS+=("$@"); break ;;
+        --help|-h)
+            echo "Usage: claude-safe [OPTIONS] [PROJECT_DIR] [-- CLAUDE_ARGS...]"
+            echo ""
+            echo "Options:"
+            echo "  --shell         Open zsh instead of Claude"
+            echo "  --no-firewall   Skip network firewall (faster start)"
+            echo "  --update        Force-update Claude Code at startup (~15s)"
+            echo "  --no-update     Skip auto-update even if image is stale"
+            echo "  --rebuild       Full image rebuild (uses \$CLAUDE_SAFE_DIR or ~/.config/claude-safe)"
+            echo "  --pull          Pull latest nightly image from GHCR and retag as $IMAGE"
+            echo "                    Source: \$CLAUDE_SAFE_REMOTE_IMAGE (default $IMAGE_REMOTE)"
+            echo "                    Requires 'gh auth login' or 'docker login ghcr.io' on the host"
+            echo "  --no-image-check  Skip the once-per-day GHCR digest check (auto-pull)"
+            echo "  --ssh [HOSTS]   Mount SSH config/keys for selected servers (read-only)"
+            echo "                    No argument: interactive server picker"
+            echo "                    HOSTS: comma-separated Host names (e.g., myserver,github.com)"
+            echo "  --azure         Mount ~/.azure for Azure CLI credentials"
+            echo "  --expo          Mount ~/.expo for EAS CLI credentials"
+            echo "  --github        Mount ~/.config/gh and extract host GitHub token (full repo access)"
+            echo "  --no-logbench   Skip mounting logbench binary + config (mounted by default)"
+            echo "  -h, --help      Show this help"
+            echo ""
+            echo "If PROJECT_DIR is omitted, mounts \$PWD."
+            echo "Auto-update triggers when image is older than ${STALE_DAYS} days."
+            echo ""
+            echo "Non-interactive mode (common flags passed directly to claude):"
+            echo "  claude-safe -p 'fix the bug in main.py'"
+            echo "  claude-safe -p 'summarize' --output-format json"
+            echo "  claude-safe /path/to/project -p 'explain this code'"
+            echo ""
+            echo "Other claude args can be passed after --:"
+            echo "  claude-safe -- --allowedTools 'Read,Grep' -p 'search for bugs'"
+            exit 0
+            ;;
+        -*)         EXTRA_ARGS+=("$1"); shift ;;
+        *)          PROJECT_DIR="$1"; shift ;;
+    esac
+done
+
+PROJECT_DIR="${PROJECT_DIR:-$(pwd)}"
+PROJECT_DIR="$(cd "$PROJECT_DIR" && pwd)"  # resolve to absolute path
+
+# ── Detect git worktree and adjust mount/workdir ──────────────────
+# When invoked from a worktree (e.g., .claude/worktrees/<name>), mount the main
+# repo root at /workspace so .git/ and symlinks resolve, and set the container's
+# working directory to the worktree path within that mount.
+MOUNT_DIR="$PROJECT_DIR"
+CONTAINER_WORKDIR="/workspace"
+IS_WORKTREE=false
+
+GIT_DIR_RAW=$(git -C "$PROJECT_DIR" rev-parse --git-dir 2>/dev/null || true)
+GIT_COMMON_RAW=$(git -C "$PROJECT_DIR" rev-parse --git-common-dir 2>/dev/null || true)
+
+if [[ -n "$GIT_DIR_RAW" && -n "$GIT_COMMON_RAW" && "$GIT_DIR_RAW" != "$GIT_COMMON_RAW" ]]; then
+    # We're in a worktree. Resolve the main repo root.
+    MAIN_GIT_DIR=$(git -C "$PROJECT_DIR" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)
+    if [[ -z "$MAIN_GIT_DIR" ]]; then
+        # Fallback for older git: resolve relative path manually
+        if [[ "$GIT_DIR_RAW" != /* ]]; then
+            GIT_DIR_RAW=$(cd "$PROJECT_DIR/$GIT_DIR_RAW" && pwd)
+        fi
+        if [[ "$GIT_COMMON_RAW" != /* ]]; then
+            MAIN_GIT_DIR=$(cd "$GIT_DIR_RAW" && cd "$GIT_COMMON_RAW" && pwd)
+        else
+            MAIN_GIT_DIR="$GIT_COMMON_RAW"
+        fi
+    fi
+
+    if [[ -n "$MAIN_GIT_DIR" ]]; then
+        MAIN_REPO_ROOT=$(dirname "$MAIN_GIT_DIR")
+        # Check if worktree is inside the main repo (e.g., .claude/worktrees/<name>)
+        case "$PROJECT_DIR" in
+            "$MAIN_REPO_ROOT"/*)
+                RELATIVE_PATH="${PROJECT_DIR#$MAIN_REPO_ROOT/}"
+                MOUNT_DIR="$MAIN_REPO_ROOT"
+                CONTAINER_WORKDIR="/workspace/$RELATIVE_PATH"
+                IS_WORKTREE=true
+                ;;
+            *)
+                echo "WARNING: External git worktree detected. Git operations may not work in container."
+                ;;
+        esac
+    fi
+fi
+
+# Derive a stable container name from the project path
+PROJECT_NAME=$(basename "$PROJECT_DIR" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-')
+CONTAINER_NAME="claude-${PROJECT_NAME}-$$"
+
+# ── Cleanup ───────────────────────────────────────────────────────
+cleanup() {
+    if [[ -n "$SSH_TMPDIR" && -d "$SSH_TMPDIR" ]]; then
+        rm -rf "$SSH_TMPDIR"
+    fi
+}
+trap cleanup EXIT
+
+# ── Auto-check GHCR for newer image (once per day, fail-open) ─────
+check_remote_image_age() {
+    # Versioned tags (e.g., :v0.1.0) are pinned; never auto-update
+    local tag="${IMAGE_REMOTE##*:}"
+    if [[ "$tag" =~ ^v[0-9] ]]; then
+        return 0
+    fi
+
+    # Throttle to once per day
+    local cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/claude-safe"
+    local check_file="$cache_dir/last-image-check"
+    local now last
+    now=$(date +%s)
+    if [[ -f "$check_file" ]]; then
+        last=$(cat "$check_file" 2>/dev/null || echo 0)
+        if [[ -n "$last" ]] && [[ $(( now - last )) -lt 86400 ]]; then
+            return 0
+        fi
+    fi
+    mkdir -p "$cache_dir"
+    echo "$now" > "$check_file"
+
+    # Local IMAGE_REMOTE tag missing → image was built locally or never pulled
+    docker image inspect "$IMAGE_REMOTE" &>/dev/null || return 0
+
+    # If $IMAGE diverged from $IMAGE_REMOTE (user rebuilt locally), don't overwrite
+    local image_id remote_image_id
+    image_id=$(docker image inspect "$IMAGE" --format '{{.Id}}' 2>/dev/null || true)
+    remote_image_id=$(docker image inspect "$IMAGE_REMOTE" --format '{{.Id}}' 2>/dev/null || true)
+    [[ -n "$image_id" && "$image_id" == "$remote_image_id" ]] || return 0
+
+    # Compare local RepoDigest vs upstream manifest digest
+    local prefix="${IMAGE_REMOTE%:*}"
+    local local_digest remote_digest
+    local_digest=$(docker image inspect "$IMAGE_REMOTE" \
+        --format '{{range .RepoDigests}}{{println .}}{{end}}' 2>/dev/null \
+        | grep "^${prefix}@" | head -n1 | awk -F@ '{print $2}')
+    [[ -n "$local_digest" ]] || return 0
+
+    remote_digest=$(docker buildx imagetools inspect "$IMAGE_REMOTE" \
+        --format '{{.Manifest.Digest}}' 2>/dev/null) || return 0
+    [[ -n "$remote_digest" ]] || return 0
+    [[ "$local_digest" != "$remote_digest" ]] || return 0
+
+    echo "==> New image on registry. Auto-pulling $IMAGE_REMOTE..."
+    if docker pull "$IMAGE_REMOTE" >/dev/null 2>&1; then
+        docker tag "$IMAGE_REMOTE" "$IMAGE"
+        echo "==> Updated $IMAGE to ${remote_digest:0:19}"
+    else
+        echo "==> Auto-pull failed; using existing image."
+    fi
+}
+
+# ── SSH host selection ────────────────────────────────────────────
+select_ssh_hosts() {
+    local config_file="$SSH_DIR/config"
+
+    if [[ ! -f "$config_file" ]]; then
+        echo "ERROR: No SSH config found at $config_file. The --ssh flag requires an SSH config file with Host entries."
+        exit 1
+    fi
+
+    # Warn about Include directives (not followed)
+    if grep -qi '^[[:space:]]*Include ' "$config_file" 2>/dev/null; then
+        echo "WARNING: SSH config contains Include directives which are not followed."
+        echo "         Only hosts defined directly in $config_file will be shown."
+        echo ""
+    fi
+
+    # Parse SSH config into Host blocks
+    # Arrays: host_names[i], host_hostnames[i], host_users[i], host_identityfiles[i] (colon-separated), host_blocks[i] (raw text)
+    local host_names=()
+    local host_hostnames=()
+    local host_users=()
+    local host_identityfiles=()
+    local host_blocks=()
+    local global_blocks=""
+
+    local current_name=""
+    local current_hostname=""
+    local current_user=""
+    local current_identityfiles=""
+    local current_block=""
+    local in_match=false
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Skip comments and empty lines
+        [[ "$line" =~ ^[[:space:]]*# ]] && continue
+        [[ -z "${line// /}" ]] && continue
+
+        # Detect Host or Match blocks
+        if [[ "$line" =~ ^[[:space:]]*Host[[:space:]]+(.*) ]]; then
+            local host_value="${BASH_REMATCH[1]}"
+            # Strip inline comments
+            host_value="${host_value%%#*}"
+            # Trim trailing whitespace
+            host_value="${host_value%"${host_value##*[![:space:]]}"}"
+
+            in_match=false
+
+            # Save previous block if any
+            if [[ -n "$current_name" ]]; then
+                if [[ "$current_name" == "*" ]]; then
+                    global_blocks+="$current_block"$'\n'
+                else
+                    host_names+=("$current_name")
+                    host_hostnames+=("$current_hostname")
+                    host_users+=("$current_user")
+                    host_identityfiles+=("$current_identityfiles")
+                    host_blocks+=("$current_block")
+                fi
+            fi
+
+            # Start new block
+            current_name="$host_value"
+            current_hostname=""
+            current_user=""
+            current_identityfiles=""
+            current_block="$line"$'\n'
+            continue
+        fi
+
+        if [[ "$line" =~ ^[[:space:]]*Match[[:space:]] ]]; then
+            # Save previous block before entering Match
+            if [[ -n "$current_name" ]]; then
+                if [[ "$current_name" == "*" ]]; then
+                    global_blocks+="$current_block"$'\n'
+                else
+                    host_names+=("$current_name")
+                    host_hostnames+=("$current_hostname")
+                    host_users+=("$current_user")
+                    host_identityfiles+=("$current_identityfiles")
+                    host_blocks+=("$current_block")
+                fi
+            fi
+            current_name=""
+            current_block=""
+            in_match=true
+            continue
+        fi
+
+        # Skip lines inside Match blocks
+        if $in_match; then
+            continue
+        fi
+
+        # Accumulate directives for current Host block
+        if [[ -n "$current_name" ]]; then
+            current_block+="$line"$'\n'
+
+            # Extract HostName
+            if [[ "$line" =~ ^[[:space:]]*HostName[[:space:]]+(.*) ]]; then
+                current_hostname="${BASH_REMATCH[1]}"
+                current_hostname="${current_hostname%%#*}"
+                current_hostname="${current_hostname%"${current_hostname##*[![:space:]]}"}"
+            fi
+
+            # Extract User
+            if [[ "$line" =~ ^[[:space:]]*User[[:space:]]+(.*) ]]; then
+                current_user="${BASH_REMATCH[1]}"
+                current_user="${current_user%%#*}"
+                current_user="${current_user%"${current_user##*[![:space:]]}"}"
+            fi
+
+            # Extract IdentityFile (may appear multiple times)
+            if [[ "$line" =~ ^[[:space:]]*IdentityFile[[:space:]]+(.*) ]]; then
+                local idfile="${BASH_REMATCH[1]}"
+                idfile="${idfile%%#*}"
+                idfile="${idfile%"${idfile##*[![:space:]]}"}"
+                if [[ -n "$current_identityfiles" ]]; then
+                    current_identityfiles+=":$idfile"
+                else
+                    current_identityfiles="$idfile"
+                fi
+            fi
+        fi
+    done < "$config_file"
+
+    # Save the last block
+    if [[ -n "$current_name" ]]; then
+        if [[ "$current_name" == "*" ]]; then
+            global_blocks+="$current_block"$'\n'
+        else
+            host_names+=("$current_name")
+            host_hostnames+=("$current_hostname")
+            host_users+=("$current_user")
+            host_identityfiles+=("$current_identityfiles")
+            host_blocks+=("$current_block")
+        fi
+    fi
+
+    if [[ ${#host_names[@]} -eq 0 ]]; then
+        echo "ERROR: No Host entries found in $config_file"
+        exit 1
+    fi
+
+    # Select hosts
+    local selected_indices=()
+
+    if [[ -n "$SSH_HOSTS" ]]; then
+        # Explicit host names provided via --ssh host1,host2
+        local explicit_hosts
+        IFS=',' read -ra explicit_hosts <<< "$SSH_HOSTS"
+        for name in "${explicit_hosts[@]}"; do
+            local found=false
+            for i in "${!host_names[@]}"; do
+                if [[ "${host_names[$i]}" == "$name" ]]; then
+                    selected_indices+=("$i")
+                    found=true
+                    break
+                fi
+            done
+            if ! $found; then
+                echo "ERROR: SSH host not found in config: $name"
+                echo "Available hosts:"
+                for h in "${host_names[@]}"; do
+                    echo "  $h"
+                done
+                exit 1
+            fi
+        done
+    elif [[ ${#host_names[@]} -eq 1 ]]; then
+        # Single host: auto-select
+        selected_indices=(0)
+        echo "==> SSH: auto-selected ${host_names[0]} (only host available)"
+    elif ! $INTERACTIVE; then
+        # Non-interactive mode without explicit hosts: error
+        echo "ERROR: --ssh requires host names in non-interactive mode"
+        echo "Available hosts:"
+        for h in "${host_names[@]}"; do
+            echo "  $h"
+        done
+        echo ""
+        echo "Usage: claude-safe --ssh ${host_names[0]} -p 'your prompt'"
+        exit 1
+    else
+        # Interactive picker
+        echo ""
+        echo "Available SSH servers:"
+        for i in "${!host_names[@]}"; do
+            local display_host="${host_hostnames[$i]:-${host_names[$i]}}"
+            local user_info=""
+            if [[ -n "${host_users[$i]}" ]]; then
+                user_info=", user: ${host_users[$i]}"
+            fi
+            local key_info=""
+            if [[ -z "${host_identityfiles[$i]}" ]]; then
+                key_info=" (no key specified)"
+            fi
+            printf "  %d) %-20s (%s%s)%s\n" $((i + 1)) "${host_names[$i]}" "$display_host" "$user_info" "$key_info"
+        done
+        echo "  a) All servers"
+        echo ""
+        read -rp "Select servers (numbers separated by spaces/commas, or 'a' for all): " selection
+
+        if [[ "$selection" == "a" || "$selection" == "A" || "$selection" == "all" ]]; then
+            for i in "${!host_names[@]}"; do
+                selected_indices+=("$i")
+            done
+        else
+            local nums
+            IFS=', ' read -ra nums <<< "$selection"
+            if [[ ${#nums[@]} -eq 0 ]]; then
+                echo "ERROR: No servers selected"
+                exit 1
+            fi
+            for num in "${nums[@]}"; do
+                if ! [[ "$num" =~ ^[0-9]+$ ]] || [[ "$num" -lt 1 || "$num" -gt ${#host_names[@]} ]]; then
+                    echo "ERROR: Invalid selection: $num (must be 1-${#host_names[@]})"
+                    exit 1
+                fi
+                selected_indices+=("$((num - 1))")
+            done
+        fi
+
+        if [[ ${#selected_indices[@]} -eq 0 ]]; then
+            echo "ERROR: No servers selected"
+            exit 1
+        fi
+    fi
+
+    # Create temp directory with selected config blocks and keys
+    SSH_TMPDIR=$(mktemp -d)
+
+    # Build minimal config: global blocks + selected host blocks
+    local config_content=""
+    if [[ -n "$global_blocks" ]]; then
+        config_content+="$global_blocks"
+    fi
+
+    local copied_keys=()
+    local selected_host_names=()
+
+    for idx in "${selected_indices[@]}"; do
+        selected_host_names+=("${host_names[$idx]}")
+        config_content+="${host_blocks[$idx]}"$'\n'
+
+        # Copy IdentityFile(s) for this host
+        if [[ -n "${host_identityfiles[$idx]}" ]]; then
+            IFS=':' read -ra idfiles <<< "${host_identityfiles[$idx]}"
+            for idfile in "${idfiles[@]}"; do
+                # Expand ~ to $HOME
+                idfile="${idfile/#\~/$HOME}"
+                # Skip if already copied (deduplication)
+                local already_copied=false
+                for ck in "${copied_keys[@]+"${copied_keys[@]}"}"; do
+                    if [[ "$ck" == "$idfile" ]]; then
+                        already_copied=true
+                        break
+                    fi
+                done
+                if $already_copied; then
+                    continue
+                fi
+
+                if [[ -f "$idfile" ]]; then
+                    local keybase
+                    keybase=$(basename "$idfile")
+                    cp "$idfile" "$SSH_TMPDIR/$keybase"
+                    chmod 600 "$SSH_TMPDIR/$keybase"
+                    copied_keys+=("$idfile")
+                    # Copy matching .pub if it exists
+                    if [[ -f "${idfile}.pub" ]]; then
+                        cp "${idfile}.pub" "$SSH_TMPDIR/${keybase}.pub"
+                        chmod 644 "$SSH_TMPDIR/${keybase}.pub"
+                    fi
+                fi
+            done
+        fi
+    done
+
+    # Write the minimal config
+    printf '%s' "$config_content" > "$SSH_TMPDIR/config"
+    chmod 644 "$SSH_TMPDIR/config"
+
+    # Copy known_hosts if it exists (needed for host verification)
+    if [[ -f "$SSH_DIR/known_hosts" ]]; then
+        cp "$SSH_DIR/known_hosts" "$SSH_TMPDIR/known_hosts"
+        chmod 644 "$SSH_TMPDIR/known_hosts"
+    fi
+
+    echo "==> SSH: server(s): ${selected_host_names[*]} (${#copied_keys[@]} key(s) copied)"
+}
+
+# ── Pull from registry if requested ───────────────────────────────
+if $PULL; then
+    echo "==> Pulling $IMAGE_REMOTE..."
+    if ! docker pull "$IMAGE_REMOTE"; then
+        echo "ERROR: docker pull failed. For private GHCR packages, log in first:"
+        echo "  echo \$GH_TOKEN | docker login ghcr.io -u <github-username> --password-stdin"
+        echo "  (or 'gh auth token | docker login ghcr.io -u <github-username> --password-stdin')"
+        exit 1
+    fi
+    docker tag "$IMAGE_REMOTE" "$IMAGE"
+    echo "==> Tagged $IMAGE_REMOTE as $IMAGE."
+fi
+
+# ── Auto-check for newer image once per day ───────────────────────
+if $CHECK_REMOTE_IMAGE && ! $PULL && ! $REBUILD; then
+    check_remote_image_age
+fi
+
+# ── Ensure prerequisites ───────────────────────────────────────────
+if ! docker image inspect "$IMAGE" &>/dev/null; then
+    echo "==> Image '$IMAGE' not found locally. Pulling $IMAGE_REMOTE..."
+    if docker pull "$IMAGE_REMOTE" >/dev/null 2>&1; then
+        docker tag "$IMAGE_REMOTE" "$IMAGE"
+        echo "==> Pulled and tagged $IMAGE."
+    else
+        echo "ERROR: Could not pull $IMAGE_REMOTE."
+        echo "  Check 'gh auth login' or 'docker login ghcr.io', then retry."
+        echo "  Or build locally: claude-safe --rebuild"
+        exit 1
+    fi
+fi
+
+# ── Rebuild if requested ──────────────────────────────────────────
+if $REBUILD; then
+    if [[ -f "$DOCKERFILE_DIR/Dockerfile" ]]; then
+        echo "==> Rebuilding image from $DOCKERFILE_DIR (--no-cache --pull)..."
+        docker build --no-cache --pull -t "$IMAGE" "$DOCKERFILE_DIR"
+        echo "==> Rebuild complete."
+    else
+        echo "ERROR: Cannot find Dockerfile at $DOCKERFILE_DIR/Dockerfile"
+        echo ""
+        echo "Either:"
+        echo "  1. Set CLAUDE_SAFE_DIR to the directory containing the Dockerfile:"
+        echo "     export CLAUDE_SAFE_DIR=/path/to/claude-safe"
+        echo ""
+        echo "  2. Or copy files to the default location:"
+        echo "     mkdir -p ~/.config/claude-safe"
+        echo "     cp /path/to/claude-safe/{Dockerfile,init-firewall.sh,.rgignore,.ripgreprc} ~/.config/claude-safe/"
+        exit 1
+    fi
+fi
+
+# ── Determine if update is needed ─────────────────────────────────
+DO_UPDATE=false
+if [[ "$UPDATE" == "force" ]]; then
+    DO_UPDATE=true
+elif [[ "$UPDATE" == "auto" ]]; then
+    # Check image age
+    CREATED=$(docker image inspect "$IMAGE" --format '{{.Created}}' 2>/dev/null || echo "")
+    if [[ -n "$CREATED" ]]; then
+        # Parse image creation timestamp to epoch
+        if command -v date &>/dev/null; then
+            # macOS date and GNU date handle -d differently
+            if date -j -f "%Y-%m-%dT%H:%M:%S" "2000-01-01T00:00:00" +%s &>/dev/null 2>&1; then
+                # macOS: use -j -f
+                CREATED_EPOCH=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${CREATED%%.*}" +%s 2>/dev/null || echo "0")
+            else
+                # GNU/Linux: use -d
+                CREATED_EPOCH=$(date -d "${CREATED}" +%s 2>/dev/null || echo "0")
+            fi
+            NOW_EPOCH=$(date +%s)
+            AGE_DAYS=$(( (NOW_EPOCH - CREATED_EPOCH) / 86400 ))
+            if [[ $AGE_DAYS -ge $STALE_DAYS ]]; then
+                echo "==> Image is ${AGE_DAYS} days old (threshold: ${STALE_DAYS}). Auto-updating Claude Code..."
+                DO_UPDATE=true
+            fi
+        fi
+    fi
+fi
+
+# ── Determine if interactive ─────────────────────────────────────
+# Non-interactive if CLAUDE_ARGS contains -p (prompt mode)
+INTERACTIVE=true
+PROMPT_TEXT=""
+if [[ ${#CLAUDE_ARGS[@]} -gt 0 ]]; then
+    for i in "${!CLAUDE_ARGS[@]}"; do
+        if [[ "${CLAUDE_ARGS[$i]}" == "-p" || "${CLAUDE_ARGS[$i]}" == "--print" ]]; then
+            INTERACTIVE=false
+            NEXT=$((i + 1))
+            if [[ -n "${CLAUDE_ARGS[$NEXT]+x}" ]]; then
+                PROMPT_TEXT="${CLAUDE_ARGS[$NEXT]}"
+            fi
+            break
+        fi
+    done
+fi
+
+# ── Select SSH hosts if requested ─────────────────────────────────
+if $MOUNT_SSH; then
+    if [[ ! -d "$SSH_DIR" ]]; then
+        echo "ERROR: SSH directory not found: $SSH_DIR"
+        exit 1
+    fi
+    select_ssh_hosts
+fi
+
+# ── Detect host timezone ──────────────────────────────────────────
+if [[ -n "${TZ:-}" ]]; then
+    HOST_TZ="$TZ"
+elif [[ -f /etc/timezone ]]; then
+    HOST_TZ=$(cat /etc/timezone)
+elif [[ -L /etc/localtime ]]; then
+    HOST_TZ=$(readlink /etc/localtime | sed 's|.*/zoneinfo/||')
+elif command -v systemsetup &>/dev/null; then
+    # macOS: "Time Zone: Europe/Amsterdam"
+    HOST_TZ=$(systemsetup -gettimezone 2>/dev/null | sed 's/.*: //')
+else
+    HOST_TZ="UTC"
+fi
+
+# ── Build the docker run command ───────────────────────────────────
+if $INTERACTIVE; then
+    CMD=(docker run -it --rm)
+else
+    CMD=(docker run --rm)
+fi
+CMD+=(
+    --name "$CONTAINER_NAME"
+    --cap-add=NET_ADMIN
+    --cap-add=NET_RAW
+    # Mount project at /workspace (main repo root when in a worktree)
+    -v "$MOUNT_DIR:/workspace"
+    # Persist Claude Code OAuth credentials across containers (Docker volume)
+    # Following Anthropic's official devcontainer approach:
+    # https://github.com/anthropics/claude-code/tree/main/.devcontainer
+    # First run: authenticate inside container with `claude` command (browser OAuth)
+    # Subsequent runs: credentials persist in Docker volume automatically
+    -v "$CREDENTIALS_VOLUME:/home/node/.claude"
+    # Git identity and GitHub token are passed as env vars (see below)
+    # Persist shell history across containers (Docker volume)
+    -v "$HISTORY_VOLUME:/commandhistory"
+    # Persist uv/uvx cache so MCP servers installed via `uvx --from git+...` aren't
+    # re-downloaded on every container start
+    -v "${HOME}/.cache/uv:/home/node/.cache/uv"
+    # Environment
+    -e "CLAUDE_CONFIG_DIR=/home/node/.claude"
+    -e "NODE_OPTIONS=--max-old-space-size=4096"
+    # Container mode: relaxes some safety checks since container provides isolation
+    # Full mode blocks: rm -rf, fork bombs, dd attacks, path traversal, etc.
+    # Container mode only blocks: dangerous git commands, sensitive file access
+    -e "CLAUDE_CONTAINER_MODE=1"
+    # Experimental: disable startup ripgrep scan to avoid 20s timeout on slow Docker bind mounts.
+    # Claude Code scans the entire directory on every invocation, which is slow on macOS Docker.
+    # See: https://github.com/anthropics/claude-code/issues/7053
+    -e "CLAUDE_CODE_ENABLE_RIPGREP=0"
+    # Enable hooks that trigger audio notifications on events
+    -e "CLAUDE_AUDIO_ENABLED=1"
+    # Timezone: inherit from host so container clock matches the user's local time
+    -e "TZ=$HOST_TZ"
+    -w "$CONTAINER_WORKDIR"
+)
+
+# Worktree: pass host repo root so the entrypoint can create a symlink for git path resolution
+if $IS_WORKTREE; then
+    CMD+=(-e "HOST_REPO_ROOT=$MOUNT_DIR")
+fi
+
+# Add any extra docker args
+if [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; then
+    CMD+=("${EXTRA_ARGS[@]}")
+fi
+
+# Git identity: extract user.name and user.email from host git config and pass
+# as env vars. This avoids mounting ~/.gitconfig (which may be a Nix symlink)
+# and avoids mounting ~/.config/gh (only needed for preferences, not auth).
+GIT_USER_NAME=$(git config user.name 2>/dev/null || true)
+GIT_USER_EMAIL=$(git config user.email 2>/dev/null || true)
+if [[ -n "$GIT_USER_NAME" ]]; then
+    CMD+=(-e "GIT_AUTHOR_NAME=$GIT_USER_NAME" -e "GIT_COMMITTER_NAME=$GIT_USER_NAME")
+fi
+if [[ -n "$GIT_USER_EMAIL" ]]; then
+    CMD+=(-e "GIT_AUTHOR_EMAIL=$GIT_USER_EMAIL" -e "GIT_COMMITTER_EMAIL=$GIT_USER_EMAIL")
+fi
+
+# GitHub CLI auth: only extract host token when --github flag is used.
+# Otherwise, the container will source GH_TOKEN from /workspace/.env at startup.
+GH_TOKEN_VALUE=""
+if $MOUNT_GITHUB; then
+    GH_TOKEN_VALUE=$(gh auth token 2>/dev/null || true)
+    if [[ -n "$GH_TOKEN_VALUE" ]]; then
+        CMD+=(-e "GH_TOKEN=$GH_TOKEN_VALUE")
+    else
+        echo "WARNING: --github flag used but could not extract GitHub token ('gh auth token' failed)."
+        echo "  To fix, run: gh auth login"
+        echo ""
+    fi
+fi
+
+# MCP server API keys: forward from host environment if set
+# MCP servers inherit the container's environment, so keys set on the host
+# (e.g., in ~/.zshrc) are passed through here.
+if [[ -n "${CONTEXT7_API_KEY:-}" ]]; then
+    CMD+=(-e "CONTEXT7_API_KEY=$CONTEXT7_API_KEY")
+fi
+if [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]]; then
+    CMD+=(-e "TELEGRAM_BOT_TOKEN=$TELEGRAM_BOT_TOKEN")
+fi
+if [[ -n "${TELEGRAM_CHAT_ID:-}" ]]; then
+    CMD+=(-e "TELEGRAM_CHAT_ID=$TELEGRAM_CHAT_ID")
+fi
+# mcp-atlassian: Jira credentials
+if [[ -n "${JIRA_URL:-}" ]]; then
+    CMD+=(-e "JIRA_URL=$JIRA_URL")
+fi
+if [[ -n "${JIRA_USERNAME:-}" ]]; then
+    CMD+=(-e "JIRA_USERNAME=$JIRA_USERNAME")
+fi
+if [[ -n "${JIRA_API_TOKEN:-}" ]]; then
+    CMD+=(-e "JIRA_API_TOKEN=$JIRA_API_TOKEN")
+fi
+if [[ -n "${JIRA_PROJECTS_FILTER:-}" ]]; then
+    CMD+=(-e "JIRA_PROJECTS_FILTER=$JIRA_PROJECTS_FILTER")
+fi
+
+# Optionally mount selected SSH server config + keys (--ssh flag, read-only)
+if $MOUNT_SSH; then
+    CMD+=(-v "$SSH_TMPDIR:/home/node/.ssh:ro")
+fi
+
+# Optionally mount GitHub CLI config (--github flag)
+if $MOUNT_GITHUB; then
+    CMD+=(-v "$HOME/.config/gh:/home/node/.config/gh:ro")
+fi
+
+# Optionally mount Azure CLI credentials (--azure flag)
+if $MOUNT_AZURE; then
+    CMD+=(-v "$AZURE_DIR:/home/node/.azure")
+fi
+
+# Optionally mount Expo/EAS CLI credentials (--expo flag)
+if $MOUNT_EXPO; then
+    CMD+=(-v "$EXPO_DIR:/home/node/.expo")
+fi
+
+# Mount logbench binary + config (default on; disable with --no-logbench)
+LOGBENCH_AVAILABLE=false
+LOGBENCH_SKIP_REASON=""
+if $MOUNT_LOGBENCH; then
+    if [[ ! -x "$LOGBENCH_BIN" ]]; then
+        LOGBENCH_SKIP_REASON="binary missing or not executable: $LOGBENCH_BIN"
+        echo "==> Logbench: skipping — $LOGBENCH_SKIP_REASON" >&2
+    elif [[ ! -f "$LOGBENCH_CONFIG" ]]; then
+        LOGBENCH_SKIP_REASON="config missing: $LOGBENCH_CONFIG"
+        echo "==> Logbench: skipping — $LOGBENCH_SKIP_REASON" >&2
+    else
+        CMD+=(-v "$LOGBENCH_BIN:/usr/local/bin/logbench:ro")
+        CMD+=(-v "$LOGBENCH_CONFIG:/home/node/.config/logbench/config.yaml:ro")
+        LOGBENCH_AVAILABLE=true
+    fi
+fi
+
+# Image
+CMD+=("$IMAGE")
+
+# ── Build entrypoint command ──────────────────────────────────────
+# Assemble a bash -c string with optional steps: symlink → .env → firewall → update → launch
+STEPS=()
+
+# Worktree: create a symlink from the host repo path to /workspace so git can
+# follow the absolute paths in the worktree's .git file (e.g., "gitdir: /Users/.../.git/worktrees/...")
+# This only affects the container filesystem — the host is not modified.
+if $IS_WORKTREE; then
+    STEPS+=('sudo mkdir -p "$(dirname "$HOST_REPO_ROOT")" && sudo ln -sfn /workspace "$HOST_REPO_ROOT"')
+fi
+
+# Source GH_TOKEN from /workspace/.env if present (scoped token for this project).
+# This runs inside the container so the token never touches the host environment.
+STEPS+=('if [ -f /workspace/.env ]; then export $(grep -E "^GH_TOKEN=" /workspace/.env | xargs); fi')
+
+if $FIREWALL; then
+    # Pass JIRA_URL through sudo so init-firewall.sh can whitelist the tenant.
+    # sudo's built-in `VAR=val command` form sets env regardless of env_keep.
+    STEPS+=('sudo JIRA_URL="${JIRA_URL:-}" /usr/local/bin/init-firewall.sh 2>/dev/null || true')
+fi
+
+if $LOGBENCH_AVAILABLE; then
+    STEPS+=('claude mcp remove logbench -s user >/dev/null 2>&1 || true')
+    STEPS+=('claude mcp add logbench -s user -e LOGBENCH_CONFIG=/home/node/.config/logbench/config.yaml -- /usr/local/bin/logbench >/dev/null 2>&1 || true')
+fi
+
+if $DO_UPDATE; then
+    STEPS+=("echo '==> Updating Claude Code...' && claude update 2>/dev/null && echo '==> Updated to:' && claude --version 2>/dev/null || true")
+fi
+
+if $SHELL_MODE; then
+    STEPS+=("exec zsh")
+else
+    # Build claude command with --dangerously-skip-permissions (container provides isolation)
+    CLAUDE_CMD="exec claude --dangerously-skip-permissions"
+    if [[ ${#CLAUDE_ARGS[@]} -gt 0 ]]; then
+        # Quote args properly for embedding in bash -c
+        for arg in "${CLAUDE_ARGS[@]}"; do
+            CLAUDE_CMD+=" $(printf '%q' "$arg")"
+        done
+    fi
+    STEPS+=("$CLAUDE_CMD")
+fi
+
+ENTRYPOINT=$(IFS='; ' ; echo "${STEPS[*]}")
+CMD+=(bash -c "$ENTRYPOINT")
+
+# ── Status display ────────────────────────────────────────────────
+if $IS_WORKTREE; then
+    echo "==> Project:   $MOUNT_DIR (repo root)"
+    echo "==> Worktree:  $RELATIVE_PATH"
+else
+    echo "==> Project:   $PROJECT_DIR"
+fi
+GIT_BRANCH=$(git -C "$PROJECT_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+if [[ -n "$GIT_BRANCH" ]]; then
+    WORKTREE_LABEL=""
+    if $IS_WORKTREE; then
+        WORKTREE_LABEL=" (worktree)"
+    fi
+    if [[ "$GIT_BRANCH" == "main" || "$GIT_BRANCH" == "master" ]]; then
+        echo -e "==> Branch:    \033[33m$GIT_BRANCH\033[0m$WORKTREE_LABEL"
+    else
+        echo -e "==> Branch:    $GIT_BRANCH$WORKTREE_LABEL"
+    fi
+fi
+if [[ -n "$PROMPT_TEXT" ]]; then
+    TRUNCATED="${PROMPT_TEXT:0:50}"
+    if [[ ${#PROMPT_TEXT} -gt 50 ]]; then
+        TRUNCATED+="…"
+    fi
+    echo "==> Prompt:    $TRUNCATED"
+fi
+if [[ -n "$GIT_USER_NAME" ]]; then
+    echo "==> Git:       $GIT_USER_NAME <$GIT_USER_EMAIL>"
+else
+    echo "==> Git:       not configured (git config user.name not set)"
+fi
+if [[ -n "$GH_TOKEN_VALUE" ]]; then
+    echo "==> GitHub:    token extracted from host (--github)"
+elif [[ -f "$MOUNT_DIR/.env" ]] && grep -qE "^GH_TOKEN=" "$MOUNT_DIR/.env" 2>/dev/null; then
+    echo "==> GitHub:    token will be loaded from .env"
+else
+    echo -e "==> GitHub:    \033[31mno token (use --github or add GH_TOKEN to .env)\033[0m"
+fi
+echo "==> Auth:      $CREDENTIALS_VOLUME (Docker volume)"
+echo -e "==> Permissions: \033[33m--dangerously-skip-permissions\033[0m (container isolation)"
+if $MOUNT_SSH; then
+    echo "==> SSH:       mounted (selected server config + keys)"
+else
+    echo "==> SSH:       false"
+fi
+if [[ -n "${CONTEXT7_API_KEY:-}" ]]; then
+    echo "==> Context7:  API key forwarded from host"
+else
+    echo "==> Context7:  no CONTEXT7_API_KEY in environment"
+fi
+if [[ -n "${TELEGRAM_BOT_TOKEN:-}" ]]; then
+    echo "==> Telegram:  bot token forwarded from host"
+else
+    echo "==> Telegram:  no TELEGRAM_BOT_TOKEN in environment"
+fi
+echo "==> Azure:     $MOUNT_AZURE"
+echo "==> Expo:      $MOUNT_EXPO"
+if $LOGBENCH_AVAILABLE; then
+    echo "==> Logbench:  mounted (MCP server registered)"
+elif $MOUNT_LOGBENCH; then
+    echo "==> Logbench:  skipped — $LOGBENCH_SKIP_REASON"
+else
+    echo "==> Logbench:  disabled (--no-logbench)"
+fi
+echo "==> Timezone:  $HOST_TZ ($(TZ=$HOST_TZ date '+%Y-%m-%d %H:%M'))"
+echo "==> Firewall:  $FIREWALL"
+echo "==> Update:    $UPDATE (will update: $DO_UPDATE)"
+echo "==> Container: $CONTAINER_NAME"
+echo ""
+
+exec "${CMD[@]}"

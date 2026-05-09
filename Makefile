@@ -1,6 +1,6 @@
 PREFIX ?= /usr/local/bin
 IMAGE := claude-code-safe
-SERVER ?= <your-server>
+SERVER ?= $(CLAUDE_SERVER_HOST)
 
 .PHONY: install install-local install-server build build-local build-server clean-local clean-server cleanup-server help
 
@@ -26,7 +26,11 @@ help:
 	@echo ""
 	@echo "Variables:"
 	@echo "  PREFIX    Installation directory (default: /usr/local/bin)"
-	@echo "  SERVER    Remote server for server targets (default: <your-server>)"
+	@echo "  SERVER    Remote server for server targets (default: \$$CLAUDE_SERVER_HOST)"
+	@echo ""
+	@echo "Persist the server host in your shell profile:"
+	@echo "  echo 'export CLAUDE_SERVER_HOST=your-host' >> ~/.zshrc   # zsh"
+	@echo "  echo 'export CLAUDE_SERVER_HOST=your-host' >> ~/.bashrc  # bash"
 
 install-local:
 	sudo cp claude-safe $(PREFIX)/claude-safe
@@ -37,6 +41,10 @@ install-server:
 	sudo cp claude-server $(PREFIX)/claude-server
 	sudo chmod 755 $(PREFIX)/claude-server
 	@echo "Installed to $(PREFIX)/claude-server"
+	@echo ""
+	@echo "Set your remote host in your shell profile:"
+	@echo "  echo 'export CLAUDE_SERVER_HOST=your-host' >> ~/.zshrc   # zsh"
+	@echo "  echo 'export CLAUDE_SERVER_HOST=your-host' >> ~/.bashrc  # bash"
 
 # Build the Docker image locally. Always pulls the latest base image and
 # ignores the layer cache to ensure the latest OS packages and Claude Code.
@@ -52,10 +60,25 @@ build-server:
 clean-local:
 	docker rmi $(IMAGE)
 
+# Guard: ensure SERVER is a real host, not the placeholder default.
+check-server:
+	@if [ -z "$(SERVER)" ] || [ "$(SERVER)" = "<your-server>" ]; then \
+		echo "ERROR: SERVER not set." >&2; \
+		echo "" >&2; \
+		echo "  One-shot:  make $(MAKECMDGOALS) SERVER=your-host" >&2; \
+		echo "" >&2; \
+		echo "  Persist in your shell profile (recommended):" >&2; \
+		echo "    echo 'export CLAUDE_SERVER_HOST=your-host' >> ~/.zshrc   # zsh" >&2; \
+		echo "    echo 'export CLAUDE_SERVER_HOST=your-host' >> ~/.bashrc  # bash" >&2; \
+		echo "  Then re-run:" >&2; \
+		echo "    make $(MAKECMDGOALS)" >&2; \
+		exit 1; \
+	fi
+
 # Remove the Docker image on the remote server. Does not affect credential volumes.
-clean-server:
+clean-server: check-server
 	ssh $(SERVER) "docker rmi $(IMAGE)"
 
 # List and remove all sessions (containers, workspaces, temp dirs) on the remote server.
-cleanup-server:
-	claude-server --cleanup-all
+cleanup-server: check-server
+	CLAUDE_SERVER_HOST=$(SERVER) claude-server --cleanup-all

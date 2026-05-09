@@ -29,6 +29,17 @@ set -euo pipefail
 
 # ── Configuration ─────────────────────────────────────────────────
 SERVER="${CLAUDE_SERVER_HOST:-<your-server>}"
+# Fail-fast: every claude-server command except --help needs a real host.
+for _arg in "$@"; do
+    case "$_arg" in -h|--help) _SKIP_HOST_CHECK=1 ;; esac
+done
+if [[ -z "${_SKIP_HOST_CHECK:-}" ]] && { [[ "$SERVER" == "<your-server>" ]] || [[ -z "$SERVER" ]]; }; then
+    echo "ERROR: CLAUDE_SERVER_HOST is not set." >&2
+    echo "  Set it for one invocation:  CLAUDE_SERVER_HOST=your-host claude-server" >&2
+    echo "  Or persist in your shell:   export CLAUDE_SERVER_HOST=your-host" >&2
+    exit 1
+fi
+unset _arg _SKIP_HOST_CHECK
 REMOTE_BASE="claude-server"  # relative to remote $HOME
 LOCAL_META_DIR="$HOME/.claude-server/sessions"
 IMAGE="claude-code-safe"

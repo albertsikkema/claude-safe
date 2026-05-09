@@ -73,7 +73,7 @@ cat <<EOF
 
 Done. Next steps:
 
-  1. Authenticate to GHCR (private image):
+  1. Authenticate to GHCR (only if the image is private):
        gh auth login            # easiest; the wrapper forwards GH_TOKEN
      or
        docker login ghcr.io     # use a GHCR PAT directly
@@ -82,3 +82,14 @@ Done. Next steps:
        claude-safe              # auto-pulls image on first run, then daily
 
 EOF
+
+if [[ -z "${CLAUDE_SAFE_NO_SERVER:-}" ]]; then
+    cat <<'EOF'
+  3. (Optional) For claude-server, set your remote host in your shell profile:
+       echo 'export CLAUDE_SERVER_HOST=your-host' >> ~/.zshrc   # zsh
+       echo 'export CLAUDE_SERVER_HOST=your-host' >> ~/.bashrc  # bash
+     Then:
+       claude-server            # ssh's to $CLAUDE_SERVER_HOST
+
+EOF
+fi

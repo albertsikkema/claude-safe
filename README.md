@@ -21,25 +21,7 @@ Created February 2025.
 
 ---
 
-## Files
-
-```
-claude-code-safe/
-├── Dockerfile         # Container image definition
-├── init-firewall.sh   # iptables firewall (whitelisted domains only)
-├── claude-safe        # Local wrapper script
-├── claude-server      # Remote server wrapper script
-├── Makefile           # Build, install, rebuild, clean targets
-├── CLAUDE.md          # Instructions for Claude Code AI assistant
-├── .rgignore          # Ripgrep ignore patterns (speeds up searches)
-├── .ripgreprc         # Ripgrep configuration
-├── .gitignore         # Git ignore patterns
-└── README.md          # This file
-```
-
----
-
-## Installation
+## Quick start
 
 ### Prerequisites
 
@@ -47,34 +29,27 @@ claude-code-safe/
 - A Claude Max or Pro subscription (for OAuth login)
 - macOS, Linux, or WSL2
 
-### Step 1: Build the image
+### 1. Install the wrapper scripts
 
 ```bash
-make build-local    # or: docker build --no-cache --pull -t claude-code-safe .
+curl -fsSL https://raw.githubusercontent.com/albertsikkema/claude-safe/main/install.sh | bash
 ```
 
-### Step 2: Install the wrapper scripts
+Installs `claude-safe` and `claude-server` to `~/.local/bin` (no sudo). The Docker image is pulled from the public GHCR registry automatically on first run — no build needed.
+
+Override the install location with `CLAUDE_SAFE_PREFIX`:
 
 ```bash
-make install-local    # installs claude-safe to /usr/local/bin/
-make install-server   # installs claude-server to /usr/local/bin/
+CLAUDE_SAFE_PREFIX=/usr/local/bin curl -fsSL https://raw.githubusercontent.com/albertsikkema/claude-safe/main/install.sh | bash
 ```
 
-**The `chmod 755` is required.** Bash scripts need read _and_ execute permission. Without it you get:
-
-```
-/usr/local/bin/claude-safe: Permission denied
-```
-
-If you transferred the file from another machine or downloaded it, macOS may also quarantine it. Check and fix:
+Skip `claude-server` if you only want the local wrapper:
 
 ```bash
-xattr /usr/local/bin/claude-safe
-# If com.apple.quarantine appears:
-sudo xattr -d com.apple.quarantine /usr/local/bin/claude-safe
+CLAUDE_SAFE_NO_SERVER=1 curl -fsSL https://raw.githubusercontent.com/albertsikkema/claude-safe/main/install.sh | bash
 ```
 
-### Step 3: First-run authentication
+### 2. First-run authentication
 
 ```bash
 claude-safe --shell
@@ -90,11 +65,31 @@ claude
 
 Credentials are stored in a Docker volume (`claude-code-credentials`) and persist across container restarts and image rebuilds. No re-auth required.
 
-To verify auth is working:
+### 3. Run it
 
 ```bash
-claude-safe   # Should launch directly into Claude Code without login prompt
+cd ~/my-project
+claude-safe
 ```
+
+That's it. The image auto-pulls on first run, then re-checks once per day for updates.
+
+### (Optional) Remote-server mode
+
+If you want to run Claude Code on a remote machine via `claude-server`, set the host in your shell profile:
+
+```bash
+echo 'export CLAUDE_SERVER_HOST=your-host' >> ~/.zshrc   # zsh
+echo 'export CLAUDE_SERVER_HOST=your-host' >> ~/.bashrc  # bash
+```
+
+Then from any project directory:
+
+```bash
+claude-server
+```
+
+See [Remote builds with `claude-server`](#remote-builds-with-claude-server) below.
 
 ---
 
@@ -126,9 +121,6 @@ claude-safe --azure
 # Mount Expo/EAS CLI credentials (~/.expo)
 claude-safe --expo
 
-# Force an update check
-claude-safe --update
-
 # Full image rebuild (pulls fresh base + latest Claude Code)
 claude-safe --rebuild
 
@@ -139,22 +131,38 @@ claude-safe --pull
 claude-safe --help
 ```
 
+### Shell alias
+
+My day-to-day invocation skips the firewall, so I keep this in `~/.zshrc`:
+
+```bash
+alias cly='claude-safe --no-firewall'
+```
+
+The container is still isolated (filesystem, processes, package installs); only the outbound network restriction is dropped. Use the bare `claude-safe` when you want the firewall back on.
+
 ---
 
 ## Remote builds with `claude-server`
 
-`claude-server` runs Claude Code containers on a remote server (default: `<your-server>`, override with `CLAUDE_SERVER_HOST`). Builds survive laptop sleep, network drops, and lid closes.
+`claude-server` runs Claude Code containers on a remote server (set `CLAUDE_SERVER_HOST=<host>` in your shell profile). Builds survive laptop sleep, network drops, and lid closes.
 
 ### Setup
 
 ```bash
-# 1. Build the Docker image on the remote server
-claude-server --rebuild
+# 1. (Once) set the remote host
+echo 'export CLAUDE_SERVER_HOST=your-host' >> ~/.zshrc
+exec zsh
 
-# 2. Authenticate (first time only — stored in Docker volume on server)
+# 2. Pull the public GHCR image to the server
+claude-server --pull
+
+# 3. Authenticate (first time only — stored in Docker volume on the server)
 claude-server --shell
 # Inside: run `claude` and complete OAuth, then exit
 ```
+
+If you'd rather build the image on the server from source instead of pulling, swap step 2 for `claude-server --rebuild`.
 
 ### Usage
 
@@ -261,26 +269,6 @@ If the bug is fixed upstream, the `mkdir`/`cd`/`rm` wrapper can be simplified to
 
 ---
 
-## Updating Claude Code
-
-The native installer includes automatic background updates ([docs](https://code.claude.com/docs/en/setup)). The wrapper script adds a staleness check on top of that:
-
-| Method | Command | What it does |
-|---|---|---|
-| Auto (default) | `claude-safe` | Checks image age. If ≥ 7 days, runs `claude update` at container startup |
-| Force | `claude-safe --update` | Always runs `claude update` regardless of age |
-| Skip | `claude-safe --no-update` | Bypasses the staleness check entirely |
-| Rebuild | `claude-safe --rebuild` | Runs `docker build --no-cache` — fresh base image, latest OS packages, fresh native install |
-| Pull | `claude-safe --pull` | Pulls the nightly image from GHCR and retags it as `claude-code-safe` (no local build) |
-
-For a full refresh (new Node base image, new OS packages, new Claude Code binary):
-
-```bash
-claude-safe --rebuild
-```
-
----
-
 ## Nightly builds (GHCR)
 
 `.github/workflows/nightly-build.yml` builds the image every night at 03:00 UTC
@@ -291,25 +279,43 @@ Tags:
 - `ghcr.io/albertsikkema/claude-code-safe:latest`
 - `ghcr.io/albertsikkema/claude-code-safe:YYYY-MM-DD`
 
-The package is **private**. Each Docker host that wants to pull needs to log in
-to GHCR once with a token that has `read:packages`:
-
-```bash
-gh auth token | docker login ghcr.io -u albertsikkema --password-stdin
-```
-
-Then pull and retag:
+The package is **public** — `docker pull` works without authentication. The wrappers handle pulling and retagging:
 
 ```bash
 claude-safe --pull            # local
-claude-server --pull          # remote (default $CLAUDE_SERVER_HOST)
+claude-server --pull          # remote ($CLAUDE_SERVER_HOST)
 ```
+
+Both also auto-pull on first run and re-check once per day.
 
 Override the source image with `CLAUDE_SAFE_REMOTE_IMAGE`. To trigger a build
 manually instead of waiting for cron:
 
 ```bash
 gh workflow run nightly-build.yml
+```
+
+---
+
+## Build from source
+
+For contributors, or if you want to modify the Dockerfile / firewall / wrappers:
+
+```bash
+git clone https://github.com/albertsikkema/claude-safe.git
+cd claude-safe
+
+make build-local        # docker build --no-cache --pull -t claude-code-safe .
+make install-local      # /usr/local/bin/claude-safe (sudo)
+make install-server     # /usr/local/bin/claude-server (sudo)
+```
+
+The `Makefile` also exposes `clean-local`, `clean-server SERVER=<host>`, `cleanup-server`, and `build-server` (builds on the remote via SSH). Run `make help` for the full list.
+
+Set `CLAUDE_SAFE_DIR` to the cloned directory if you want `claude-safe --rebuild` to work after installing the wrapper script outside the repo:
+
+```bash
+echo 'export CLAUDE_SAFE_DIR=$HOME/claude-safe' >> ~/.zshrc
 ```
 
 ---
@@ -590,18 +596,21 @@ claude-safe --no-firewall
 
 ### `--rebuild` can't find Dockerfile
 
-The `--rebuild` flag looks for the Dockerfile in `$CLAUDE_SAFE_DIR` (check the `DOCKERFILE_DIR` variable in `claude-safe` for the hardcoded fallback path). If you installed the script to `/usr/local/bin/` but the Dockerfile is elsewhere, either:
+The `--rebuild` flag looks for the Dockerfile in `$CLAUDE_SAFE_DIR` (default `$HOME/claude-safe`). If you installed via `install.sh` only, the source isn't on disk — clone it first:
 
-1. Set the environment variable:
-   ```bash
-   export CLAUDE_SAFE_DIR=/path/to/claude-safe
-   claude-safe --rebuild
-   ```
+```bash
+git clone https://github.com/albertsikkema/claude-safe.git ~/claude-safe
+claude-safe --rebuild
+```
 
-2. Or rebuild manually:
-   ```bash
-   docker build --no-cache -t claude-code-safe ~/claude-code-image/
-   ```
+If your clone lives elsewhere, point `CLAUDE_SAFE_DIR` at it:
+
+```bash
+export CLAUDE_SAFE_DIR=/path/to/claude-safe
+claude-safe --rebuild
+```
+
+Note: most users don't need `--rebuild` at all — `claude-safe --pull` fetches the nightly-built image from GHCR, which is what the auto-update path uses.
 
 ---
 

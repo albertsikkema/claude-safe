@@ -2,8 +2,9 @@
 # Uses native installer (npm is deprecated):
 #   https://code.claude.com/docs/en/setup
 #
-# Build once:  docker build -t claude-code-safe .
-# Run:         claude-safe   (via the wrapper script)
+# Image is built nightly in CI and pushed to ghcr.io/albertsikkema/claude-code-safe.
+# To build locally for development: docker build -t claude-code-safe .
+# Run via the claude-safe / claude-server wrapper scripts.
 
 # Pinned by digest; bump via Renovate/Dependabot or manually:
 #   docker buildx imagetools inspect node:24-bookworm-slim

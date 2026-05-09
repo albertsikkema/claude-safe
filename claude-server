@@ -18,7 +18,7 @@
 #   claude-server --pull                     # pull latest nightly image from GHCR
 #
 # First-time setup:
-#   1. claude-server --rebuild              # build image on server
+#   1. claude-server --pull                 # pull image from public GHCR onto server
 #   2. claude-server --shell                # authenticate via browser OAuth
 #
 # Prerequisites:
@@ -44,7 +44,6 @@ REMOTE_BASE="claude-server"  # relative to remote $HOME
 LOCAL_META_DIR="$HOME/.claude-server/sessions"
 IMAGE="claude-code-safe"
 IMAGE_REMOTE="${CLAUDE_SAFE_REMOTE_IMAGE:-ghcr.io/albertsikkema/claude-code-safe:latest}"
-STALE_DAYS=7
 CHECK_REMOTE_IMAGE=true  # auto-check GHCR for newer image once per day
 DOCKERFILE_DIR="${CLAUDE_SAFE_DIR:-$HOME/claude-safe}"
 CREDENTIALS_VOLUME="claude-code-credentials"
@@ -217,8 +216,8 @@ cmd_rebuild() {
 cmd_pull() {
     echo "==> Pulling $IMAGE_REMOTE on $SERVER..."
     if ! ssh -t "${SSH_OPTS[@]}" "$SERVER" "docker pull '$IMAGE_REMOTE' && docker tag '$IMAGE_REMOTE' '$IMAGE'"; then
-        echo "ERROR: docker pull failed on $SERVER. For private GHCR, log in on the server:"
-        echo "  ssh $SERVER 'echo \$GH_TOKEN | docker login ghcr.io -u <github-username> --password-stdin'"
+        echo "ERROR: docker pull failed on $SERVER. Check network and retry,"
+        echo "  or build there: claude-server --rebuild"
         exit 1
     fi
     echo "==> Tagged $IMAGE_REMOTE as $IMAGE on $SERVER."
@@ -323,7 +322,6 @@ esac
 PROJECT_DIR=""
 SHELL_MODE=false
 FIREWALL=true
-UPDATE="auto"
 REBUILD=false
 MOUNT_SSH=false
 SSH_HOSTS=""
@@ -339,8 +337,6 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --shell)       SHELL_MODE=true; shift ;;
         --no-firewall) FIREWALL=false; shift ;;
-        --update)      UPDATE="force"; shift ;;
-        --no-update)   UPDATE="skip"; shift ;;
         --no-image-check) CHECK_REMOTE_IMAGE=false; shift ;;
         --ssh)
             MOUNT_SSH=true; shift
@@ -378,8 +374,6 @@ while [[ $# -gt 0 ]]; do
             echo "Build options:"
             echo "  --shell             Interactive zsh via tmux (detachable)"
             echo "  --no-firewall       Skip network firewall"
-            echo "  --update            Force-update Claude Code at startup"
-            echo "  --no-update         Skip auto-update"
             echo "  --no-image-check    Skip the once-per-day GHCR digest check (auto-pull)"
             echo "  --follow            Follow logs after starting (Ctrl+C to detach)"
             echo "  --server HOST       Override server (default: \$CLAUDE_SERVER_HOST or <your-server>)"
@@ -679,29 +673,9 @@ if ! ssh_cmd "docker image inspect $IMAGE" &>/dev/null; then
         echo "==> Pulled and tagged $IMAGE on $SERVER."
     else
         echo "ERROR: Could not pull $IMAGE_REMOTE on $SERVER."
-        echo "  Check 'docker login ghcr.io' on the server, then retry."
+        echo "  Check network on the server, then retry."
         echo "  Or build there: claude-server --rebuild"
         exit 1
-    fi
-fi
-
-# ── Determine if update is needed ─────────────────────────────────
-DO_UPDATE=false
-if [[ "$UPDATE" == "force" ]]; then
-    DO_UPDATE=true
-elif [[ "$UPDATE" == "auto" ]]; then
-    CREATED=$(ssh_cmd "docker image inspect $IMAGE --format '{{.Created}}'" 2>/dev/null || echo "")
-    if [[ -n "$CREATED" ]]; then
-        # Use GNU date on the remote server (Linux)
-        CREATED_EPOCH=$(ssh_cmd "date -d '$CREATED' +%s" 2>/dev/null || echo "0")
-        NOW_EPOCH=$(ssh_cmd "date +%s" 2>/dev/null || echo "0")
-        if [[ "$CREATED_EPOCH" != "0" && "$NOW_EPOCH" != "0" ]]; then
-            AGE_DAYS=$(( (NOW_EPOCH - CREATED_EPOCH) / 86400 ))
-            if [[ $AGE_DAYS -ge $STALE_DAYS ]]; then
-                echo "==> Image is ${AGE_DAYS} days old (threshold: ${STALE_DAYS}). Auto-updating Claude Code..."
-                DO_UPDATE=true
-            fi
-        fi
     fi
 fi
 
@@ -790,11 +764,6 @@ ENTRYPOINT_LINES+=('if [ -f /workspace/.env ]; then set -a; . /workspace/.env; s
 if $FIREWALL; then
     # Pass JIRA_URL through sudo so init-firewall.sh can whitelist the tenant.
     ENTRYPOINT_LINES+=('sudo JIRA_URL="${JIRA_URL:-}" /usr/local/bin/init-firewall.sh 2>/dev/null || true')
-fi
-
-# Update
-if $DO_UPDATE; then
-    ENTRYPOINT_LINES+=("echo '==> Updating Claude Code...' && claude update 2>/dev/null && echo '==> Updated to:' && claude --version 2>/dev/null || true")
 fi
 
 # Main command
@@ -960,7 +929,6 @@ else
     echo "==> SSH:         false"
 fi
 echo "==> Firewall:    $FIREWALL"
-echo "==> Update:      $UPDATE (will update: $DO_UPDATE)"
 echo ""
 
 # ── Launch ────────────────────────────────────────────────────────

@@ -37,6 +37,10 @@ install-server:
 	sudo cp claude-server $(PREFIX)/claude-server
 	sudo chmod 755 $(PREFIX)/claude-server
 	@echo "Installed to $(PREFIX)/claude-server"
+	@echo ""
+	@echo "Set your remote host in your shell profile:"
+	@echo "  echo 'export CLAUDE_SERVER_HOST=your-host' >> ~/.zshrc   # zsh"
+	@echo "  echo 'export CLAUDE_SERVER_HOST=your-host' >> ~/.bashrc  # bash"
 
 # Build the Docker image locally. Always pulls the latest base image and
 # ignores the layer cache to ensure the latest OS packages and Claude Code.

@@ -21,7 +21,7 @@ env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/claude-code-safe
 
 jobs:
-  build:
+  build-per-arch:
     strategy:
       fail-fast: true
       matrix:
@@ -63,13 +63,13 @@ jobs:
           provenance: false
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true
 
-      - name: Export digest
+      - name: Record digest filename for manifest job
         run: |
           mkdir -p /tmp/digests
           digest="${{ steps.build.outputs.digest }}"
           touch "/tmp/digests/${digest#sha256:}"
 
-      - name: Upload digest
+      - name: Upload digest as artifact
         uses: actions/upload-artifact@v4
         with:
           name: digests-${{ matrix.arch }}
@@ -77,8 +77,8 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  merge:
-    needs: build
+  publish-manifest:
+    needs: build-per-arch
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -86,7 +86,7 @@ jobs:
     outputs:
       date: ${{ steps.meta.outputs.date }}
     steps:
-      - name: Download digests
+      - name: Download per-arch digests
         uses: actions/download-artifact@v4
         with:
           path: /tmp/digests
@@ -107,7 +107,7 @@ jobs:
         id: meta
         run: echo "date=$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
 
-      - name: Create multi-arch manifest
+      - name: Assemble and tag multi-arch manifest
         working-directory: /tmp/digests
         run: |
           docker buildx imagetools create \
@@ -115,11 +115,11 @@ jobs:
             -t "${IMAGE}:${{ steps.meta.outputs.date }}" \
             $(printf "${IMAGE}@sha256:%s " *)
 
-      - name: Inspect manifest
+      - name: Verify published manifest
         run: docker buildx imagetools inspect "${IMAGE}:latest"
 
   smoke-test:
-    needs: merge
+    needs: publish-manifest
     strategy:
       fail-fast: false
       matrix:

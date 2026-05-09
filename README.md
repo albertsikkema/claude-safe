@@ -418,7 +418,7 @@ The firewall is **DNS-based at startup time** — it resolves whitelisted domain
 - **Processes:** Container PID namespace — Claude cannot see or signal host processes
 - **Network:** Firewall restricts outbound to whitelisted domains only (when enabled)
 - **Package installs:** Anything Claude installs (npm, pip, apt) stays inside the container and is discarded on exit
-- **Destructive commands:** With `CLAUDE_CONTAINER_MODE=1`, commands like `rm -rf /` are contained — they can only affect the container, not the host
+- **Destructive commands:** Commands like `rm -rf /` are contained by the container itself — they only affect the ephemeral container filesystem and the mounted workspace, not the host
 
 ### What is NOT isolated
 
@@ -457,23 +457,15 @@ Following [Anthropic's official devcontainer approach](https://github.com/anthro
 
 Claude Code normally prompts for approval on every file write, command execution, etc. Inside an isolated container this is unnecessary friction — the container _is_ the sandbox. The wrapper script passes this flag by default. If you want interactive approval, edit the `claude-safe` script and remove it from the `STEPS` array.
 
-### Container mode (`CLAUDE_CONTAINER_MODE=1`)
+### Marker env var (`CLAUDE_CONTAINER_MODE=1`)
 
-The wrapper script sets `CLAUDE_CONTAINER_MODE=1` to signal that Claude Code is running inside an isolated container. This relaxes certain safety checks that are redundant when container isolation is already in place.
+The wrapper sets `CLAUDE_CONTAINER_MODE=1` purely as a presence marker. It is **not** read by Claude Code itself — it is a flag this project owns so that anything running inside the container can detect that it is executing inside the `claude-safe` sandbox.
 
-**Full mode (default, outside containers) blocks:**
-- `rm -rf` and dangerous rm patterns
-- Fork bombs
-- Dangerous git commands (push to main/master, force push)
-- Disk write attacks (`dd` to `/dev/`)
-- Sensitive file access (`.env`, `.pem`, credentials, etc.)
-- Path traversal and project escape
+Use cases:
+- Your own shell init, hooks, or setup scripts inside the container can branch on it (e.g., skip host-only configuration, choose container-specific paths, relax interactive prompts that don't make sense in a non-TTY sandbox).
+- You as a user can check it (`echo $CLAUDE_CONTAINER_MODE`) to confirm you're in the safe container vs. on the host.
 
-**Container mode blocks only:**
-- Dangerous git commands (push to main/master, force push)
-- Sensitive file access (`.env`, `.pem`, credentials, etc.)
-
-The rationale: destructive filesystem operations (`rm -rf`, fork bombs, disk attacks) are contained within the ephemeral container and cannot affect the host system beyond the mounted workspace. However, git operations that push to remotes and access to sensitive files remain blocked since those can have effects outside the container.
+The value `1` has no special meaning; only the presence of the variable is checked. Don't unset it in the wrappers — anything in the container that relies on this signal will silently stop branching correctly.
 
 ### Why `node:20-bookworm-slim` as base
 
@@ -496,7 +488,7 @@ The image includes common development tools beyond the base Node.js environment:
 | Variable | Value | Purpose |
 |---|---|---|
 | `CLAUDE_CONFIG_DIR` | `/home/node/.claude` | Auth credential location |
-| `CLAUDE_CONTAINER_MODE` | `1` | Relaxes safety checks (see above) |
+| `CLAUDE_CONTAINER_MODE` | `1` | Marker so in-container scripts, hooks, and users can detect the safe-container environment (see above) |
 | `CLAUDE_CODE_ENABLE_RIPGREP` | `0` | Disables startup ripgrep scan to avoid 20s timeout on slow Docker bind mounts ([#7053](https://github.com/anthropics/claude-code/issues/7053)) |
 | `CLAUDE_AUDIO_ENABLED` | `1` | Enables audio notifications on events |
 | `NODE_OPTIONS` | `--max-old-space-size=4096` | Increases Node.js heap limit |

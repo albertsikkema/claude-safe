@@ -121,9 +121,6 @@ claude-safe --azure
 # Mount Expo/EAS CLI credentials (~/.expo)
 claude-safe --expo
 
-# Force an update check
-claude-safe --update
-
 # Full image rebuild (pulls fresh base + latest Claude Code)
 claude-safe --rebuild
 

@@ -10,14 +10,10 @@
 #   claude-safe --ssh myserver      # mount SSH config/keys for specific server(s)
 #   claude-safe --azure             # mount ~/.azure for Azure CLI credentials
 #   claude-safe --expo              # mount ~/.expo for EAS CLI credentials
-#   claude-safe --update            # force update Claude Code before launching
 #   claude-safe --rebuild           # full image rebuild (--no-cache)
 #   claude-safe --pull              # pull latest nightly image from GHCR and retag
 #   claude-safe -p "prompt"         # non-interactive mode with prompt
 #   claude-safe -- <claude-args>    # pass other args to claude
-#
-# Auto-update: If the image is older than 7 days, Claude Code is updated
-# inside the container at startup. Use --no-update to skip this.
 #
 # Prerequisites:
 #   docker build -t claude-code-safe /path/to/this/directory
@@ -39,7 +35,6 @@ HISTORY_VOLUME="claude-code-history"
 CREDENTIALS_VOLUME="claude-code-credentials"
 GIT_USER_NAME=""    # git user identity (extracted from host config)
 GIT_USER_EMAIL=""   # git user email (extracted from host config)
-STALE_DAYS=7  # auto-update if image older than this
 CHECK_REMOTE_IMAGE=true  # auto-check GHCR for newer image once per day
 
 # Directory containing Dockerfile (override with CLAUDE_SAFE_DIR env var)
@@ -49,7 +44,6 @@ DOCKERFILE_DIR="${CLAUDE_SAFE_DIR:-$HOME/claude-safe}"
 PROJECT_DIR=""
 SHELL_MODE=false
 FIREWALL=true
-UPDATE="auto"  # "auto" | "force" | "skip"
 REBUILD=false
 PULL=false
 MOUNT_SSH=false
@@ -66,8 +60,6 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --shell)       SHELL_MODE=true; shift ;;
         --no-firewall) FIREWALL=false; shift ;;
-        --update)      UPDATE="force"; shift ;;
-        --no-update)   UPDATE="skip"; shift ;;
         --rebuild)     REBUILD=true; shift ;;
         --pull)        PULL=true; shift ;;
         --no-image-check) CHECK_REMOTE_IMAGE=false; shift ;;
@@ -93,8 +85,6 @@ while [[ $# -gt 0 ]]; do
             echo "Options:"
             echo "  --shell         Open zsh instead of Claude"
             echo "  --no-firewall   Skip network firewall (faster start)"
-            echo "  --update        Force-update Claude Code at startup (~15s)"
-            echo "  --no-update     Skip auto-update even if image is stale"
             echo "  --rebuild       Full image rebuild (uses \$CLAUDE_SAFE_DIR or ~/.config/claude-safe)"
             echo "  --pull          Pull latest nightly image from GHCR and retag as $IMAGE"
             echo "                    Source: \$CLAUDE_SAFE_REMOTE_IMAGE (default $IMAGE_REMOTE)"
@@ -110,7 +100,6 @@ while [[ $# -gt 0 ]]; do
             echo "  -h, --help      Show this help"
             echo ""
             echo "If PROJECT_DIR is omitted, mounts \$PWD."
-            echo "Auto-update triggers when image is older than ${STALE_DAYS} days."
             echo ""
             echo "Non-interactive mode (common flags passed directly to claude):"
             echo "  claude-safe -p 'fix the bug in main.py'"
@@ -580,34 +569,6 @@ if $REBUILD; then
     fi
 fi
 
-# ── Determine if update is needed ─────────────────────────────────
-DO_UPDATE=false
-if [[ "$UPDATE" == "force" ]]; then
-    DO_UPDATE=true
-elif [[ "$UPDATE" == "auto" ]]; then
-    # Check image age
-    CREATED=$(docker image inspect "$IMAGE" --format '{{.Created}}' 2>/dev/null || echo "")
-    if [[ -n "$CREATED" ]]; then
-        # Parse image creation timestamp to epoch
-        if command -v date &>/dev/null; then
-            # macOS date and GNU date handle -d differently
-            if date -j -f "%Y-%m-%dT%H:%M:%S" "2000-01-01T00:00:00" +%s &>/dev/null 2>&1; then
-                # macOS: use -j -f
-                CREATED_EPOCH=$(date -j -f "%Y-%m-%dT%H:%M:%S" "${CREATED%%.*}" +%s 2>/dev/null || echo "0")
-            else
-                # GNU/Linux: use -d
-                CREATED_EPOCH=$(date -d "${CREATED}" +%s 2>/dev/null || echo "0")
-            fi
-            NOW_EPOCH=$(date +%s)
-            AGE_DAYS=$(( (NOW_EPOCH - CREATED_EPOCH) / 86400 ))
-            if [[ $AGE_DAYS -ge $STALE_DAYS ]]; then
-                echo "==> Image is ${AGE_DAYS} days old (threshold: ${STALE_DAYS}). Auto-updating Claude Code..."
-                DO_UPDATE=true
-            fi
-        fi
-    fi
-fi
-
 # ── Determine if interactive ─────────────────────────────────────
 # Non-interactive if CLAUDE_ARGS contains -p (prompt mode)
 INTERACTIVE=true
@@ -818,10 +779,6 @@ if $LOGBENCH_AVAILABLE; then
     STEPS+=('claude mcp add logbench -s user -e LOGBENCH_CONFIG=/home/node/.config/logbench/config.yaml -- /usr/local/bin/logbench >/dev/null 2>&1 || true')
 fi
 
-if $DO_UPDATE; then
-    STEPS+=("echo '==> Updating Claude Code...' && claude update 2>/dev/null && echo '==> Updated to:' && claude --version 2>/dev/null || true")
-fi
-
 if $SHELL_MODE; then
     STEPS+=("exec zsh")
 else
@@ -905,7 +862,6 @@ else
 fi
 echo "==> Timezone:  $HOST_TZ ($(TZ=$HOST_TZ date '+%Y-%m-%d %H:%M'))"
 echo "==> Firewall:  $FIREWALL"
-echo "==> Update:    $UPDATE (will update: $DO_UPDATE)"
 echo "==> Container: $CONTAINER_NAME"
 echo ""
 

@@ -681,10 +681,21 @@ CMD+=(
 # or the cached uv mount). Opt out with --keep-venv if you want a single
 # shared on-disk venv between host and container (only safe when both are
 # the same OS/arch — e.g., a Linux host).
+#
+# Options:
+# - tmpfs-size caps RAM use; without it Docker defaults to half the host's
+#   RAM, which is fine on a 16GB laptop but risky on smaller hosts and gives
+#   the container unbounded room to grow. .venv rarely exceeds 1GB even on
+#   ML projects; node_modules can occasionally hit 2GB, so we give it more.
+# - tmpfs-mode 1777 (world-writable + sticky) is Docker's default and is
+#   what we want: a fresh tmpfs is owned by root (UID 0), and the container
+#   runs as 'node' (UID 1000). Mode 0755 would let only root write, so any
+#   'uv venv' / 'npm install' Claude runs would fail with EACCES. Setting
+#   1777 explicitly documents intent.
 if ! $KEEP_VENV; then
     CMD+=(
-        --mount "type=tmpfs,destination=/workspace/.venv"
-        --mount "type=tmpfs,destination=/workspace/node_modules"
+        --mount "type=tmpfs,destination=/workspace/.venv,tmpfs-size=2g,tmpfs-mode=1777"
+        --mount "type=tmpfs,destination=/workspace/node_modules,tmpfs-size=4g,tmpfs-mode=1777"
     )
 fi
 

@@ -89,6 +89,15 @@ cmd_status() {
 # Strip cs- prefix if user passes container name instead of session ID
 normalize_session() { local s="$1"; [[ "$s" == cs-* ]] && s="${s#cs-}"; echo "$s"; }
 
+# Print the reattach/sync/logs/stop command block for a session
+print_session_hints() {
+    local session="$1"
+    echo -e "Reattach: \033[1;36mclaude-server --attach $session\033[0m"
+    echo -e "Sync:     \033[1;36mclaude-server --sync $session\033[0m"
+    echo -e "Logs:     \033[1;36mclaude-server --logs $session\033[0m"
+    echo -e "Stop:     \033[1;36mclaude-server --stop $session\033[0m"
+}
+
 cmd_logs() {
     local session; session=$(normalize_session "${1:?Usage: claude-server --logs <session-id>}")
     local container="cs-${session}"
@@ -147,7 +156,18 @@ cmd_attach() {
     local session; session=$(normalize_session "${1:?Usage: claude-server --attach <session-id>}")
     echo "==> Attaching to tmux session cs-$session on $SERVER..."
     echo "    (Detach with Ctrl+B, D)"
+    echo ""
+    print_session_hints "$session"
+    echo ""
     ssh -t "${SSH_OPTS[@]}" "$SERVER" "tmux attach -t cs-$session"
+    # If tmux session still exists, user detached — re-print hints. Else: ended.
+    if ssh_cmd "tmux has-session -t cs-$session 2>/dev/null"; then
+        echo ""
+        print_session_hints "$session"
+    else
+        echo ""
+        echo "==> Session ended."
+    fi
 }
 
 cmd_exec() {
@@ -959,7 +979,8 @@ if $INTERACTIVE || $SHELL_MODE; then
     # Interactive/shell: wrap in tmux for detachability
     echo ""
     echo -e "==> Starting interactive session in tmux (detach: \033[1;33mCtrl+B\033[0m, then \033[1;33mD\033[0m)"
-    echo -e "==> Reattach later: \033[1;36mclaude-server --attach $SESSION_ID\033[0m"
+    echo ""
+    print_session_hints "$SESSION_ID"
     echo ""
     TMUX_SESSION="cs-$SESSION_ID"
     # Create detached tmux session, configure status bar, then attach
@@ -971,15 +992,17 @@ if $INTERACTIVE || $SHELL_MODE; then
         && ssh_cmd "tmux set -t $TMUX_SESSION status-right '  claude-server --attach $SESSION_ID '" \
         && ssh_cmd "tmux set -t $TMUX_SESSION status-right-length 80"
     ssh -t "${SSH_OPTS[@]}" "$SERVER" "tmux attach -t $TMUX_SESSION"
-    # After detach/disconnect: reprint session info so user can see it
-    echo ""
-    echo "==> Session:     $SESSION_ID"
-    echo "==> Container:   $CONTAINER_NAME"
-    echo ""
-    echo -e "Reattach: \033[1;36mclaude-server --attach $SESSION_ID\033[0m"
-    echo -e "Sync:     \033[1;36mclaude-server --sync $SESSION_ID\033[0m"
-    echo -e "Logs:     \033[1;36mclaude-server --logs $SESSION_ID\033[0m"
-    echo -e "Stop:     \033[1;36mclaude-server --stop $SESSION_ID\033[0m"
+    # If tmux session still exists, user detached — re-print hints. Else: ended.
+    if ssh_cmd "tmux has-session -t $TMUX_SESSION 2>/dev/null"; then
+        echo ""
+        echo "==> Session:     $SESSION_ID"
+        echo "==> Container:   $CONTAINER_NAME"
+        echo ""
+        print_session_hints "$SESSION_ID"
+    else
+        echo ""
+        echo "==> Session ended."
+    fi
 else
     # Non-interactive: start detached container
     echo "==> Starting detached build..."

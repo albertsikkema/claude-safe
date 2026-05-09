@@ -53,6 +53,14 @@ MOUNT_AZURE=false
 MOUNT_EXPO=false
 MOUNT_GITHUB=false
 MOUNT_LOGBENCH=true
+# By default, hide host .venv and node_modules from the container by overlaying
+# them with empty tmpfs mounts. Reasoning: .venv built on macOS contains mach-o
+# binaries that the Linux container can't execute, and node_modules with native
+# addons is similarly platform-specific. Without the mask, anything Claude does
+# inside the container ('uv venv', 'npm install', etc.) writes through the bind
+# mount and clobbers the host copy with Linux artifacts. --keep-venv disables
+# the mask if you actually want the host venv visible inside.
+KEEP_VENV=false
 EXTRA_ARGS=()
 CLAUDE_ARGS=()
 
@@ -73,6 +81,7 @@ while [[ $# -gt 0 ]]; do
         --expo)        MOUNT_EXPO=true; shift ;;
         --github)      MOUNT_GITHUB=true; shift ;;
         --no-logbench) MOUNT_LOGBENCH=false; shift ;;
+        --keep-venv)   KEEP_VENV=true; shift ;;
         -p|--print)    CLAUDE_ARGS+=("$1" "$2"); shift 2 ;;
         --output-format) CLAUDE_ARGS+=("$1" "$2"); shift 2 ;;
         --verbose)     CLAUDE_ARGS+=("$1"); shift ;;
@@ -96,6 +105,8 @@ while [[ $# -gt 0 ]]; do
             echo "  --expo          Mount ~/.expo for EAS CLI credentials"
             echo "  --github        Mount ~/.config/gh and extract host GitHub token (full repo access)"
             echo "  --no-logbench   Skip mounting logbench binary + config (mounted by default)"
+            echo "  --keep-venv     Expose host .venv/ and node_modules/ to the container"
+            echo "                    (default: hidden so the container can't clobber host artifacts)"
             echo "  -h, --help      Show this help"
             echo ""
             echo "If PROJECT_DIR is omitted, mounts \$PWD."
@@ -617,7 +628,10 @@ CMD+=(
     --name "$CONTAINER_NAME"
     --cap-add=NET_ADMIN
     --cap-add=NET_RAW
-    # Mount project at /workspace (main repo root when in a worktree)
+    # Mount project at /workspace (main repo root when in a worktree).
+    # Docker bind mounts have no exclude mechanism — every file/dir under
+    # $MOUNT_DIR is visible to the container. The tmpfs overlays below mask
+    # specific subpaths to prevent host/container collisions.
     -v "$MOUNT_DIR:/workspace"
     # Persist Claude Code OAuth credentials across containers (Docker volume)
     # Following Anthropic's official devcontainer approach:
@@ -648,6 +662,31 @@ CMD+=(
     -e "TZ=$HOST_TZ"
     -w "$CONTAINER_WORKDIR"
 )
+
+# Mask host-built virtualenvs and node_modules with empty tmpfs filesystems.
+#
+# Why: the project bind mount above exposes the entire $MOUNT_DIR to the
+# container, including a host-built .venv/ (mach-o binaries on macOS) and
+# node_modules/ (potentially with native .node addons compiled for the host
+# arch/OS). Both are unusable inside the Linux container, and any 'uv venv',
+# 'python -m venv', or 'npm install' Claude runs would write Linux artifacts
+# back through the bind mount and corrupt the host copy.
+#
+# How: tmpfs mounts are applied AFTER the bind mount, so they shadow the
+# corresponding paths from the container's perspective only. The host
+# directories are untouched. Anything the container creates inside .venv/
+# or node_modules/ lives in container memory and is discarded on exit.
+#
+# Trade-off: re-installs are needed each container run (pip/npm hit network
+# or the cached uv mount). Opt out with --keep-venv if you want a single
+# shared on-disk venv between host and container (only safe when both are
+# the same OS/arch — e.g., a Linux host).
+if ! $KEEP_VENV; then
+    CMD+=(
+        --mount "type=tmpfs,destination=/workspace/.venv"
+        --mount "type=tmpfs,destination=/workspace/node_modules"
+    )
+fi
 
 # Worktree: pass host repo root so the entrypoint can create a symlink for git path resolution
 if $IS_WORKTREE; then
@@ -851,6 +890,11 @@ else
 fi
 echo "==> Azure:     $MOUNT_AZURE"
 echo "==> Expo:      $MOUNT_EXPO"
+if $KEEP_VENV; then
+    echo "==> Venv mask: off (host .venv and node_modules visible — --keep-venv)"
+else
+    echo "==> Venv mask: on (host .venv and node_modules hidden via tmpfs)"
+fi
 if $LOGBENCH_AVAILABLE; then
     echo "==> Logbench:  mounted (MCP server registered)"
 elif $MOUNT_LOGBENCH; then

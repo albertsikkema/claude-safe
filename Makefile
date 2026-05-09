@@ -1,6 +1,6 @@
 PREFIX ?= /usr/local/bin
 IMAGE := claude-code-safe
-SERVER ?= <your-server>
+SERVER ?= $(CLAUDE_SERVER_HOST)
 
 .PHONY: install install-local install-server build build-local build-server clean-local clean-server cleanup-server help
 
@@ -26,7 +26,11 @@ help:
 	@echo ""
 	@echo "Variables:"
 	@echo "  PREFIX    Installation directory (default: /usr/local/bin)"
-	@echo "  SERVER    Remote server for server targets (default: <your-server>)"
+	@echo "  SERVER    Remote server for server targets (default: \$$CLAUDE_SERVER_HOST)"
+	@echo ""
+	@echo "Persist the server host in your shell profile:"
+	@echo "  echo 'export CLAUDE_SERVER_HOST=your-host' >> ~/.zshrc   # zsh"
+	@echo "  echo 'export CLAUDE_SERVER_HOST=your-host' >> ~/.bashrc  # bash"
 
 install-local:
 	sudo cp claude-safe $(PREFIX)/claude-safe
@@ -60,8 +64,14 @@ clean-local:
 check-server:
 	@if [ -z "$(SERVER)" ] || [ "$(SERVER)" = "<your-server>" ]; then \
 		echo "ERROR: SERVER not set." >&2; \
-		echo "  Pass it:   make $(MAKECMDGOALS) SERVER=your-host" >&2; \
-		echo "  Or export: export CLAUDE_SERVER_HOST=your-host && make $(MAKECMDGOALS) SERVER=\$$CLAUDE_SERVER_HOST" >&2; \
+		echo "" >&2; \
+		echo "  One-shot:  make $(MAKECMDGOALS) SERVER=your-host" >&2; \
+		echo "" >&2; \
+		echo "  Persist in your shell profile (recommended):" >&2; \
+		echo "    echo 'export CLAUDE_SERVER_HOST=your-host' >> ~/.zshrc   # zsh" >&2; \
+		echo "    echo 'export CLAUDE_SERVER_HOST=your-host' >> ~/.bashrc  # bash" >&2; \
+		echo "  Then re-run:" >&2; \
+		echo "    make $(MAKECMDGOALS)" >&2; \
 		exit 1; \
 	fi
 

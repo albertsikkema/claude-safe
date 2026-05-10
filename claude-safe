@@ -829,7 +829,7 @@ fi
 
 # Source GH_TOKEN from /workspace/.env if present (scoped token for this project).
 # This runs inside the container so the token never touches the host environment.
-STEPS+=('if [ -f /workspace/.env ]; then export $(grep -E "^GH_TOKEN=" /workspace/.env | xargs); fi')
+STEPS+=('if [ -f /workspace/.env ]; then GH_LINE=$(grep -E "^GH_TOKEN=" /workspace/.env | xargs); [ -n "$GH_LINE" ] && export "$GH_LINE"; fi')
 
 if $FIREWALL; then
     # Pass JIRA_URL through sudo so init-firewall.sh can whitelist the tenant.

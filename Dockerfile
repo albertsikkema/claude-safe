@@ -116,9 +116,10 @@ RUN printf '#!/bin/sh\nif [ -n "$VIRTUAL_ENV" ]; then\n  exec uv pip "$@"\nelse\
     && cp /home/node/.local/bin/pip /home/node/.local/bin/pip3 \
     && chmod +x /home/node/.local/bin/pip /home/node/.local/bin/pip3
 
-# Install Playwright Chromium browser (~200MB) into /home/node/.cache/ms-playwright.
-# Baked into the image so the playwright MCP server works without runtime download.
-RUN npx -y playwright@latest install chromium
+# Install chrome-for-testing for Playwright MCP into /home/node/.cache/ms-playwright.
+# chrome-for-testing is what @playwright/mcp defaults to; baking it in avoids forcing
+# every consumer to add --browser flags to their .mcp.json.
+RUN npx -y @playwright/mcp@latest install-browser chrome-for-testing
 
 # Ensure claude and uv/ruff are on PATH
 ENV PATH="/home/node/.local/bin:/home/node/go/bin:${PATH}"

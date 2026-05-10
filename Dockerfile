@@ -85,6 +85,10 @@ RUN git config --system credential.helper '!/usr/bin/gh auth git-credential'
 # Install EAS CLI (Expo Application Services) - must run as root for global npm install
 RUN npm install -g eas-cli
 
+# Playwright Chromium system deps (libnss3, libxkbcommon0, etc.) - root + apt-get
+RUN npx -y playwright@latest install-deps chromium \
+    && rm -rf /var/lib/apt/lists/*
+
 # Switch to non-root user
 USER node
 
@@ -111,6 +115,10 @@ RUN printf '#!/bin/sh\nif [ -n "$VIRTUAL_ENV" ]; then\n  exec uv pip "$@"\nelse\
     > /home/node/.local/bin/pip \
     && cp /home/node/.local/bin/pip /home/node/.local/bin/pip3 \
     && chmod +x /home/node/.local/bin/pip /home/node/.local/bin/pip3
+
+# Install Playwright Chromium browser (~200MB) into /home/node/.cache/ms-playwright.
+# Baked into the image so the playwright MCP server works without runtime download.
+RUN npx -y playwright@latest install chromium
 
 # Ensure claude and uv/ruff are on PATH
 ENV PATH="/home/node/.local/bin:/home/node/go/bin:${PATH}"

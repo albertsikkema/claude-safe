@@ -246,11 +246,18 @@ The flags `-p`, `--output-format`, `--verbose`, `--max-turns`, and `--model` are
 
 ## Native installer (not npm)
 
+> **Pinned version:** Claude Code is pinned to v2.1.110 (build arg `CLAUDE_VERSION`).
+> Recent versions shipped after the Opus 4.7 release show degraded performance
+> (slower, more tokens, worse results). This pin is an attempt to stay on a
+> known-good version until quality stabilizes. Override with
+> `docker build --build-arg CLAUDE_VERSION=latest .` if you want the newest build.
+
 Anthropic has deprecated npm installation of Claude Code. The Dockerfile uses the **native installer**:
 
 ```dockerfile
+ARG CLAUDE_VERSION=2.1.110
 RUN mkdir -p /tmp/claude-install && cd /tmp/claude-install \
-    && curl -fsSL https://claude.ai/install.sh | bash \
+    && curl -fsSL https://claude.ai/install.sh | bash -s -- "$CLAUDE_VERSION" \
     && rm -rf /tmp/claude-install
 ```
 

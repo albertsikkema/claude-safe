@@ -97,13 +97,14 @@ USER node
 # OOM workaround: run from /tmp, not a large directory
 # Ref: https://github.com/anthropics/claude-code/issues/22536
 # Retry loop: installer can 429 under rate limits
+ARG CLAUDE_VERSION=2.1.110
 RUN mkdir -p /tmp/claude-install && cd /tmp/claude-install \
     && for i in 1 2 3 4 5; do \
-         curl -fsSL https://claude.ai/install.sh | bash && break; \
+         curl -fsSL https://claude.ai/install.sh | bash -s -- "$CLAUDE_VERSION" && break; \
          echo "==> Attempt $i failed, waiting ${i}0s before retry..."; \
          sleep $((i * 10)); \
        done \
-    && rm -rf /tmp/claude-install
+    && cd / && rm -rf /tmp/claude-install
 
 # Install uv and ruff (Python toolchain)
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh \

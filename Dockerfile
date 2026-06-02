@@ -27,6 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         | gpg --dearmor -o /usr/share/keyrings/microsoft.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/azure-cli/ $(lsb_release -cs) main" \
         | tee /etc/apt/sources.list.d/azure-cli.list > /dev/null \
+    && curl -1sLf 'https://artifacts-cli.infisical.com/setup.deb.sh' | bash \
     && apt-get update && apt-get install -y --no-install-recommends \
         tzdata \
         git \
@@ -55,7 +56,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         make \
         gcc \
         libc-dev \
-    && apt-get install -y gh azure-cli \
+    && apt-get install -y gh azure-cli infisical \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Go

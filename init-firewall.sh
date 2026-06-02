@@ -86,10 +86,22 @@ ALLOWED_DOMAINS=(
     # Logbench / Axiom
     "api.axiom.co"
     "api.eu.axiom.co"
+    # Infisical
+    "app.infisical.com"
+    "api.infisical.com"
+    "artifacts-cli.infisical.com"
     # Atlassian (mcp-atlassian)
     "api.atlassian.com"
     "id.atlassian.com"
 )
+
+# Append self-hosted Infisical domain if provided.
+if [[ -n "${INFISICAL_DOMAIN:-}" ]]; then
+    infisical_host=$(echo "$INFISICAL_DOMAIN" | sed -E 's#^https?://##; s#/.*$##; s#:.*$##')
+    if [[ -n "$infisical_host" ]]; then
+        ALLOWED_DOMAINS+=("$infisical_host")
+    fi
+fi
 
 # Append tenant host from JIRA_URL if provided (e.g. mycorp.atlassian.net).
 # Firewall is DNS-based and wildcards don't work — add the concrete host.

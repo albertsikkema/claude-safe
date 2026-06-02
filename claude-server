@@ -184,7 +184,7 @@ cmd_cleanup() {
 
     echo "==> Cleaning up session $session..."
     ssh_cmd "docker stop $container 2>/dev/null; docker rm $container 2>/dev/null" || true
-    ssh_cmd "rm -rf ~/$REMOTE_BASE/$session /tmp/cs-ssh-$session /tmp/cs-azure-$session /tmp/cs-expo-$session /tmp/cs-gh-$session" || true
+    ssh_cmd "rm -rf ~/$REMOTE_BASE/$session /tmp/cs-ssh-$session /tmp/cs-azure-$session /tmp/cs-expo-$session /tmp/cs-infisical-$session /tmp/cs-gh-$session" || true
     ssh_cmd "tmux kill-session -t cs-$session 2>/dev/null" || true
     rm -f "$LOCAL_META_DIR/$session"
     echo "==> Cleaned up."
@@ -211,7 +211,7 @@ cmd_cleanup_all() {
     # Remove all workspaces (but not .build/)
     ssh_cmd "find ~/$REMOTE_BASE -maxdepth 1 -mindepth 1 -type d ! -name '.build' -exec rm -rf {} +" || true
     # Remove all temp credential dirs
-    ssh_cmd "rm -rf /tmp/cs-ssh-* /tmp/cs-azure-* /tmp/cs-expo-* /tmp/cs-gh-*" || true
+    ssh_cmd "rm -rf /tmp/cs-ssh-* /tmp/cs-azure-* /tmp/cs-expo-* /tmp/cs-infisical-* /tmp/cs-gh-*" || true
     # Remove local metadata
     rm -rf "$LOCAL_META_DIR"
     mkdir -p "$LOCAL_META_DIR"
@@ -373,6 +373,7 @@ SSH_HOSTS=""
 SSH_TMPDIR=""
 MOUNT_AZURE=false
 MOUNT_EXPO=false
+MOUNT_INFISICAL=true
 MOUNT_GITHUB=false
 FOLLOW=false
 EXTRA_ARGS=()
@@ -391,6 +392,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --azure)       MOUNT_AZURE=true; shift ;;
         --expo)        MOUNT_EXPO=true; shift ;;
+        --no-infisical) MOUNT_INFISICAL=false; shift ;;
         --github)      MOUNT_GITHUB=true; shift ;;
         --follow)      FOLLOW=true; shift ;;
         --server)      SERVER="$2"; shift 2 ;;
@@ -425,6 +427,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --ssh [HOSTS]       Copy SSH config/keys to server for container"
             echo "  --azure             Copy ~/.azure to server for container"
             echo "  --expo              Copy ~/.expo to server for container"
+            echo "  --no-infisical      Skip copying ~/.infisical (copied by default)"
             echo "  --github            Extract and pass GH_TOKEN"
             echo "  -p 'prompt'         Non-interactive build (primary use case)"
             echo "  -h, --help          Show this help"
@@ -788,6 +791,15 @@ if $MOUNT_EXPO; then
     fi
 fi
 
+INFISICAL_DIR="$HOME/.infisical"
+REMOTE_INFISICAL_DIR=""
+if $MOUNT_INFISICAL && [[ -d "$INFISICAL_DIR" ]]; then
+    REMOTE_INFISICAL_DIR="/tmp/cs-infisical-$SESSION_ID"
+    ssh_cmd "mkdir -p $REMOTE_INFISICAL_DIR"
+    rsync -az -e "ssh ${SSH_OPTS[*]}" "$INFISICAL_DIR/" "$SERVER:$REMOTE_INFISICAL_DIR/"
+    echo "==> Infisical credentials copied to server"
+fi
+
 REMOTE_GH_DIR=""
 if $MOUNT_GITHUB; then
     if [[ -d "$HOME/.config/gh" ]]; then
@@ -808,8 +820,8 @@ ENTRYPOINT_LINES+=('if [ -f /workspace/.env ]; then set -a; . /workspace/.env; s
 
 # Firewall
 if $FIREWALL; then
-    # Pass JIRA_URL through sudo so init-firewall.sh can whitelist the tenant.
-    ENTRYPOINT_LINES+=('sudo JIRA_URL="${JIRA_URL:-}" /usr/local/bin/init-firewall.sh 2>/dev/null || true')
+    # Pass JIRA_URL and INFISICAL_DOMAIN through sudo so init-firewall.sh can whitelist tenants.
+    ENTRYPOINT_LINES+=('sudo JIRA_URL="${JIRA_URL:-}" INFISICAL_DOMAIN="${INFISICAL_DOMAIN:-}" /usr/local/bin/init-firewall.sh 2>/dev/null || true')
 fi
 
 # Main command
@@ -898,6 +910,13 @@ fi
 if [[ -n "${JIRA_PROJECTS_FILTER:-}" ]]; then
     DOCKER_LINES+=("    -e \"JIRA_PROJECTS_FILTER=$JIRA_PROJECTS_FILTER\" \\")
 fi
+# Infisical
+if [[ -n "${INFISICAL_TOKEN:-}" ]]; then
+    DOCKER_LINES+=("    -e \"INFISICAL_TOKEN=$INFISICAL_TOKEN\" \\")
+fi
+if [[ -n "${INFISICAL_DOMAIN:-}" ]]; then
+    DOCKER_LINES+=("    -e \"INFISICAL_DOMAIN=$INFISICAL_DOMAIN\" \\")
+fi
 
 # SSH mount
 if [[ -n "$REMOTE_SSH_DIR" ]]; then
@@ -917,6 +936,11 @@ fi
 # Expo/EAS CLI credentials mount
 if [[ -n "$REMOTE_EXPO_DIR" ]]; then
     DOCKER_LINES+=("    -v \"$REMOTE_EXPO_DIR:/home/node/.expo\" \\")
+fi
+
+# Infisical CLI credentials mount
+if [[ -n "$REMOTE_INFISICAL_DIR" ]]; then
+    DOCKER_LINES+=("    -v \"$REMOTE_INFISICAL_DIR:/home/node/.infisical\" \\")
 fi
 
 # uv cache (server-local, persists across sessions)

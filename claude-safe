@@ -10,6 +10,7 @@
 #   claude-safe --ssh myserver      # mount SSH config/keys for specific server(s)
 #   claude-safe --azure             # mount ~/.azure for Azure CLI credentials
 #   claude-safe --expo              # mount ~/.expo for EAS CLI credentials
+#   claude-safe --no-infisical      # skip mounting ~/.infisical
 #   claude-safe --rebuild           # full image rebuild (--no-cache)
 #   claude-safe --pull              # pull latest nightly image from GHCR and retag
 #   claude-safe -p "prompt"         # non-interactive mode with prompt
@@ -29,6 +30,7 @@ IMAGE_REMOTE="${CLAUDE_SAFE_REMOTE_IMAGE:-ghcr.io/albertsikkema/claude-code-safe
 SSH_DIR="$HOME/.ssh"
 AZURE_DIR="$HOME/.azure"
 EXPO_DIR="$HOME/.expo"
+INFISICAL_DIR="$HOME/.infisical"
 LOGBENCH_BIN="$HOME/.local/bin/logbench-linux-arm64"
 LOGBENCH_CONFIG="$HOME/.config/logbench/config.yaml"
 HISTORY_VOLUME="claude-code-history"
@@ -51,6 +53,7 @@ SSH_HOSTS=""        # comma-separated host names (empty = interactive picker)
 SSH_TMPDIR=""      # temp directory for selected keys (cleaned up on exit)
 MOUNT_AZURE=false
 MOUNT_EXPO=false
+MOUNT_INFISICAL=true
 MOUNT_GITHUB=false
 MOUNT_LOGBENCH=true
 # By default, hide host .venv and node_modules from the container by overlaying
@@ -79,6 +82,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --azure)       MOUNT_AZURE=true; shift ;;
         --expo)        MOUNT_EXPO=true; shift ;;
+        --no-infisical) MOUNT_INFISICAL=false; shift ;;
         --github)      MOUNT_GITHUB=true; shift ;;
         --no-logbench) MOUNT_LOGBENCH=false; shift ;;
         --keep-venv)   KEEP_VENV=true; shift ;;
@@ -103,6 +107,7 @@ while [[ $# -gt 0 ]]; do
             echo "                    HOSTS: comma-separated Host names (e.g., myserver,github.com)"
             echo "  --azure         Mount ~/.azure for Azure CLI credentials"
             echo "  --expo          Mount ~/.expo for EAS CLI credentials"
+            echo "  --no-infisical  Skip mounting ~/.infisical (mounted by default)"
             echo "  --github        Mount ~/.config/gh and extract host GitHub token (full repo access)"
             echo "  --no-logbench   Skip mounting logbench binary + config (mounted by default)"
             echo "  --keep-venv     Expose host .venv/ and node_modules/ to the container"
@@ -775,6 +780,13 @@ fi
 if [[ -n "${JIRA_PROJECTS_FILTER:-}" ]]; then
     CMD+=(-e "JIRA_PROJECTS_FILTER=$JIRA_PROJECTS_FILTER")
 fi
+# Infisical
+if [[ -n "${INFISICAL_TOKEN:-}" ]]; then
+    CMD+=(-e "INFISICAL_TOKEN=$INFISICAL_TOKEN")
+fi
+if [[ -n "${INFISICAL_DOMAIN:-}" ]]; then
+    CMD+=(-e "INFISICAL_DOMAIN=$INFISICAL_DOMAIN")
+fi
 
 # Optionally mount selected SSH server config + keys (--ssh flag, read-only)
 if $MOUNT_SSH; then
@@ -794,6 +806,11 @@ fi
 # Optionally mount Expo/EAS CLI credentials (--expo flag)
 if $MOUNT_EXPO; then
     CMD+=(-v "$EXPO_DIR:/home/node/.expo")
+fi
+
+# Mount Infisical CLI credentials (default on; disable with --no-infisical)
+if $MOUNT_INFISICAL && [[ -d "$INFISICAL_DIR" ]]; then
+    CMD+=(-v "$INFISICAL_DIR:/home/node/.infisical")
 fi
 
 # Mount logbench binary + config (default on; disable with --no-logbench)
@@ -832,9 +849,9 @@ fi
 STEPS+=('if [ -f /workspace/.env ]; then GH_LINE=$(grep -E "^GH_TOKEN=" /workspace/.env | xargs); [ -n "$GH_LINE" ] && export "$GH_LINE"; fi')
 
 if $FIREWALL; then
-    # Pass JIRA_URL through sudo so init-firewall.sh can whitelist the tenant.
+    # Pass JIRA_URL and INFISICAL_DOMAIN through sudo so init-firewall.sh can whitelist tenants.
     # sudo's built-in `VAR=val command` form sets env regardless of env_keep.
-    STEPS+=('sudo JIRA_URL="${JIRA_URL:-}" /usr/local/bin/init-firewall.sh 2>/dev/null || true')
+    STEPS+=('sudo JIRA_URL="${JIRA_URL:-}" INFISICAL_DOMAIN="${INFISICAL_DOMAIN:-}" /usr/local/bin/init-firewall.sh 2>/dev/null || true')
 fi
 
 if $LOGBENCH_AVAILABLE; then
@@ -916,6 +933,7 @@ else
 fi
 echo "==> Azure:     $MOUNT_AZURE"
 echo "==> Expo:      $MOUNT_EXPO"
+echo "==> Infisical: $MOUNT_INFISICAL"
 if $KEEP_VENV; then
     echo "==> Venv mask: off (host .venv and node_modules visible — --keep-venv)"
 else

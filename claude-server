@@ -838,8 +838,10 @@ else
         ENTRYPOINT_LINES+=("$CLAUDE_CMD || true")
         ENTRYPOINT_LINES+=('exit 0')
     else
-        # Non-interactive: tee output to log file for later retrieval
-        ENTRYPOINT_LINES+=("$CLAUDE_CMD 2>&1 | tee /workspace/.claude-server.log; exit \${PIPESTATUS[0]}")
+        # Non-interactive: tee output to log file for later retrieval.
+        # script -qfc allocates a PTY so Node.js (claude) uses line buffering
+        # instead of 8KB block buffering, giving tail -f live output.
+        ENTRYPOINT_LINES+=("script -qfc \"$CLAUDE_CMD\" /dev/null 2>&1 | tee /workspace/.claude-server.log; exit \${PIPESTATUS[0]}")
     fi
 fi
 

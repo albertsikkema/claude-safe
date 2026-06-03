@@ -105,7 +105,7 @@ cmd_logs() {
     # Check if container is running
     if ssh_cmd "docker ps -q --filter name=^${container}$" 2>/dev/null | grep -q .; then
         echo "==> Following logs for $container (Ctrl+C to detach)..."
-        ssh_cmd "docker logs -f $container"
+        ssh_cmd "docker exec $container tail -f /workspace/.claude-server.log"
     else
         echo "==> Container not running. Checking saved log..."
         ssh_cmd "cat ~/$REMOTE_BASE/$session/.claude-server.log 2>/dev/null" || echo "No logs found for session: $session"
@@ -1045,6 +1045,6 @@ else
     if $FOLLOW; then
         echo ""
         echo "==> Following logs (Ctrl+C to detach, build continues on server)..."
-        ssh_cmd "docker logs -f $CONTAINER_NAME" || true
+        ssh_cmd "docker exec $CONTAINER_NAME tail -f /workspace/.claude-server.log" || true
     fi
 fi

@@ -17,7 +17,7 @@ A standalone Docker image and wrapper scripts for running [Claude Code](https://
 - **Zero friction** — Auto-passes `--dangerously-skip-permissions` since the container itself is the sandbox
 - **Remote builds** — `claude-server` runs builds on a remote server via SSH, wrapped in tmux for detachability
 
-Created February 2025.
+Created February 2025. Last updated August 2026.
 
 ---
 

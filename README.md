@@ -10,7 +10,7 @@ A standalone Docker image and wrapper scripts for running [Claude Code](https://
 - **One image, any project** — No `.devcontainer` folder required. Build once, mount any directory.
 - **Persistent authentication** — OAuth credentials stored in a Docker volume. Authenticate once, reuse everywhere.
 - **Network firewall** — iptables rules restrict outbound traffic to whitelisted domains (Claude API, GitHub, npm, Azure, Expo, PyPI, etc.)
-- **Cloud CLI support** — GitHub CLI, Azure CLI, and EAS CLI (Expo) pre-installed with firewall rules configured
+- **Cloud CLI support** — GitHub CLI, Azure CLI, Google Cloud CLI, and EAS CLI (Expo) pre-installed with firewall rules configured
 - **Selective SSH mounting** — Interactive server picker or explicit host list; copies only selected config blocks and keys
 - **Python toolchain** — uv, ruff, and pip-audit pre-installed for Python development
 - **Native installer** — Uses the official native installer (not deprecated npm package) with automatic updates
@@ -120,6 +120,9 @@ claude-safe --azure
 
 # Mount Expo/EAS CLI credentials (~/.expo)
 claude-safe --expo
+
+# Inject a short-lived GCP service account token (auto-refreshed)
+claude-safe --gcp-sa deployer@my-project.iam.gserviceaccount.com
 
 # Full image rebuild (pulls fresh base + latest Claude Code)
 claude-safe --rebuild
@@ -238,6 +241,7 @@ The flags `-p`, `--output-format`, `--verbose`, `--max-turns`, and `--model` are
 | `~/.config/gh` | `/home/node/.config/gh` | bind mount (ro) | GitHub CLI config (with `--github` flag) |
 | `~/.azure` | `/home/node/.azure` | bind mount | Azure CLI credentials (with `--azure` flag) |
 | `~/.expo` | `/home/node/.expo` | bind mount | EAS CLI credentials (with `--expo` flag) |
+| temp dir (token file) | `/run/gcp` | bind mount (ro) | Short-lived GCP access token (with `--gcp-sa` flag) |
 | `claude-code-history` | `/commandhistory` | Docker volume | Shell history (persisted) |
 
 **Why `.venv` and `node_modules` are masked.** The whole project is bind-mounted, so host directories are normally visible inside the container. A host-built `.venv/` (mach-o binaries on macOS) and host-built `node_modules/` (with native addons) can't run on Linux, and anything Claude does inside the container (`uv venv`, `npm install`, etc.) would write Linux artifacts back through the bind mount and corrupt the host copy. Empty tmpfs overlays at those two paths hide the host versions inside the container; the host directories are untouched. Pass `--keep-venv` to disable the masks (only safe when host and container share OS+arch).
@@ -343,6 +347,7 @@ When `claude-safe` runs (without `--no-firewall`), the container sets up iptable
 - `login.microsoftonline.com`, `management.azure.com`, `graph.microsoft.com`, `management.core.windows.net`, `portal.azure.com`, `login.microsoft.com`, `aadcdn.msauth.net`, `aadcdn.msftauth.net` (Azure CLI)
 - `expo.dev`, `api.expo.dev`, `u.expo.dev`, `packages.expo.dev` (Expo/EAS)
 - `pypi.org`, `files.pythonhosted.org` (Python packages)
+- All Google IPv4 ranges from [`goog.json`](https://www.gstatic.com/ipranges/goog.json), fetched at startup (gcloud and every `*.googleapis.com` API). Note this includes Google Cloud customer ranges, so any GCP-hosted endpoint is reachable.
 
 **Also allowed:** DNS (port 53), SSH (port 22), loopback, established connections.
 
@@ -379,6 +384,31 @@ az account show
 Note: Wildcard domains (e.g., `*.blob.core.windows.net`) don't work with the DNS-based firewall. You may need to add specific storage account hostnames (e.g., `mystorageaccount.blob.core.windows.net`) or use `--no-firewall` for sessions requiring extensive Azure Storage access.
 
 The firewall requires `--cap-add=NET_ADMIN --cap-add=NET_RAW`, which the wrapper script adds automatically.
+
+### Google Cloud (gcloud) and service accounts
+
+`gcloud` is installed in the image and all Google IP ranges are allowed by the firewall.
+
+To give the container a service account without putting a key file in it, use `--gcp-sa`:
+
+```bash
+claude-safe --gcp-sa deployer@my-project.iam.gserviceaccount.com [--gcp-project my-project]
+claude-server --gcp-sa deployer@my-project.iam.gserviceaccount.com -p "deploy to staging"
+```
+
+How it works:
+
+1. On the host, the wrapper runs `gcloud auth print-access-token --impersonate-service-account=<SA>` to mint a 1-hour access token. Your own gcloud login stays on the host.
+2. The token is written to a private temp dir (mode 700/600) mounted read-only at `/run/gcp`. The container has `CLOUDSDK_AUTH_ACCESS_TOKEN_FILE=/run/gcp/token`, so every `gcloud` command reads the current token.
+3. A background refresher on the host mints a new token every 50 minutes and replaces the file atomically. It polls against wall-clock time, so after the laptop wakes from sleep it refreshes within a minute. It stops and deletes the token dir when the container exits.
+
+Host prerequisites: `gcloud` installed and logged in (`gcloud auth login`), and `roles/iam.serviceAccountTokenCreator` on the service account. The project defaults to your host `gcloud config get-value project`; override with `--gcp-project`. Both flags can also be set via `CLAUDE_SAFE_GCP_SA` / `CLAUDE_SAFE_GCP_PROJECT`.
+
+Limitations:
+
+- **`claude-server`:** the refresher runs on your laptop and pushes tokens over SSH. While the laptop sleeps or is offline, nothing refreshes, so a detached build loses GCP access about an hour after the last refresh.
+- **Client libraries / Terraform** don't read a token file. Read it per command, e.g. `GOOGLE_OAUTH_ACCESS_TOKEN=$(cat /run/gcp/token) terraform plan`.
+- If a refresh fails, the reason is logged to `/run/gcp/refresh.log` (visible inside the container, `claude-safe` only).
 
 ### Expo/EAS CLI support
 
@@ -437,6 +467,7 @@ The firewall is **DNS-based at startup time** — it resolves whitelisted domain
 - **SSH keys:** With `--ssh` flag, selected SSH config blocks and keys are mounted read-only
 - **Azure credentials:** With `--azure` flag, `~/.azure` is mounted, giving access to Azure CLI tokens
 - **Expo credentials:** With `--expo` flag, `~/.expo` is mounted, giving access to EAS CLI tokens
+- **GCP tokens:** With `--gcp-sa`, Claude can use (and read) a service account access token valid for up to 1 hour. No key or refresh token enters the container.
 - **DNS exfiltration:** Data could theoretically be encoded in DNS queries (port 53 is open)
 
 ---
@@ -484,7 +515,7 @@ The image includes common development tools beyond the base Node.js environment:
 
 - **Shell:** zsh with Oh My Zsh (default shell)
 - **Version control:** git, GitHub CLI (`gh`)
-- **Cloud CLIs:** Azure CLI (`az`), EAS CLI (`eas`)
+- **Cloud CLIs:** Azure CLI (`az`), Google Cloud CLI (`gcloud`), EAS CLI (`eas`)
 - **Search:** ripgrep (`rg`), fd (`fdfind`), fzf
 - **Utilities:** jq, vim, tmux, curl, wget, ffmpeg
 - **Python:** python3, uv, ruff, pip-audit

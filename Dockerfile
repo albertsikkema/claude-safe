@@ -12,7 +12,7 @@ FROM node:24-bookworm-slim@sha256:24dc26ef1e3c3690f27ebc4136c9c186c3133b25563ae4
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Single layer: install minimal bootstrap, register gh + Azure CLI repos,
+# Single layer: install minimal bootstrap, register gh + Azure CLI + gcloud repos,
 # then install the full toolchain. One apt update per layer instead of three.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
@@ -27,6 +27,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         | gpg --dearmor -o /usr/share/keyrings/microsoft.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/azure-cli/ $(lsb_release -cs) main" \
         | tee /etc/apt/sources.list.d/azure-cli.list > /dev/null \
+    && curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg \
+        | gpg --dearmor -o /usr/share/keyrings/cloud.google.gpg \
+    && echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt cloud-sdk main" \
+        | tee /etc/apt/sources.list.d/google-cloud-sdk.list > /dev/null \
     && curl -1sLf 'https://artifacts-cli.infisical.com/setup.deb.sh' | bash \
     && apt-get update && apt-get install -y --no-install-recommends \
         tzdata \
@@ -57,6 +61,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc \
         libc-dev \
     && apt-get install -y gh azure-cli infisical \
+    && apt-get install -y --no-install-recommends google-cloud-cli \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Go
@@ -132,7 +137,7 @@ RUN sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master
     && echo 'export PATH="$HOME/.local/bin:$PATH"' >> /home/node/.zshrc
 
 # User-owned dirs and files
-RUN mkdir -p /home/node/.claude /home/node/.azure
+RUN mkdir -p /home/node/.claude /home/node/.azure /home/node/.config/gcloud
 WORKDIR /workspace
 ENV SHELL=/bin/zsh
 CMD ["zsh"]

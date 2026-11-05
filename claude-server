@@ -16,6 +16,7 @@
 #   claude-server --cleanup <session>        # remove workspace from server
 #   claude-server --rebuild                  # build Docker image on server
 #   claude-server --pull                     # pull latest nightly image from GHCR
+#   claude-server --gcp-sa SA_EMAIL -p "..." # inject short-lived GCP token (auto-refreshed)
 #
 # First-time setup:
 #   1. claude-server --pull                 # pull image from public GHCR onto server
@@ -42,6 +43,8 @@ fi
 unset _arg _SKIP_HOST_CHECK
 REMOTE_BASE="claude-server"  # relative to remote $HOME
 LOCAL_META_DIR="$HOME/.claude-server/sessions"
+GCP_PID_DIR="$HOME/.claude-server/gcp-refresh"  # <session>.pid for --gcp-sa refreshers
+GCP_REFRESH_AFTER=3000                          # impersonated tokens live 1h; refresh at 50 min
 IMAGE="claude-code-safe"
 IMAGE_REMOTE="${CLAUDE_SAFE_REMOTE_IMAGE:-ghcr.io/albertsikkema/claude-code-safe:latest}"
 CHECK_REMOTE_IMAGE=true  # auto-check GHCR for newer image once per day
@@ -71,6 +74,55 @@ SSH_OPTS=(-o "ControlMaster=auto" -o "ControlPath=$SSH_CONTROL" -o "ControlPersi
 
 # Wrapper: use for all non-interactive SSH commands
 ssh_cmd() { ssh "${SSH_OPTS[@]}" "$SERVER" "$@"; }
+
+# ── GCP token helpers (--gcp-sa) ──────────────────────────────────
+# Mint an impersonated access token on the laptop and push it to
+# /tmp/cs-gcp-<session>/token on the server (atomic tmp + mv). The directory is
+# bind-mounted read-only into the container; gcloud reads the file per command.
+# Uses its own plain ssh (no ControlPath) because the refresher outlives this
+# script and the shared master connection is closed on exit.
+gcp_push_token() {
+    local sa="$1" server="$2" rdir="$3" tok
+    tok=$(gcloud auth print-access-token --impersonate-service-account="$sa" 2>/dev/null) || return 1
+    [[ -n "$tok" ]] || return 1
+    ssh -o BatchMode=yes "$server" \
+        "umask 077; mkdir -p $rdir && cat > $rdir/token.tmp && mv -f $rdir/token.tmp $rdir/token && date -u +%Y-%m-%dT%H:%M:%SZ > $rdir/refreshed_at" \
+        <<< "$tok"
+}
+
+# Background refresher, detached from this script. Polls every 60s against
+# wall-clock time so it refreshes within a minute of the laptop waking up.
+# Exits (and removes the remote token dir) once the container is gone.
+# Limitation: while the laptop sleeps nothing refreshes, so a long detached
+# build loses GCP access ~1h after the last refresh.
+gcp_refresher() {
+    local sa="$1" server="$2" rdir="$3" container="$4" pidfile="$5" last now
+    trap '' HUP   # survive the launching terminal closing
+    last=$(date +%s)
+    while true; do
+        sleep 60
+        now=$(date +%s)
+        (( now - last >= GCP_REFRESH_AFTER )) || continue
+        # Container gone (finished, stopped, cleaned up) -> stop refreshing.
+        # A failed ssh (offline) is not "gone"; only an explicit "no" counts.
+        if [[ "$(ssh -o BatchMode=yes "$server" "docker inspect $container >/dev/null 2>&1 && echo yes || echo no" 2>/dev/null)" == "no" ]]; then
+            ssh -o BatchMode=yes "$server" "rm -rf $rdir" 2>/dev/null || true
+            break
+        fi
+        if gcp_push_token "$sa" "$server" "$rdir" 2>/dev/null; then
+            last=$now
+        fi
+    done
+    rm -f "$pidfile"
+}
+
+gcp_stop_refresher() {
+    local session="$1" pidfile="$GCP_PID_DIR/$1.pid"
+    if [[ -f "$pidfile" ]]; then
+        kill "$(cat "$pidfile")" 2>/dev/null || true
+        rm -f "$pidfile"
+    fi
+}
 
 # ── Subcommand functions ──────────────────────────────────────────
 cmd_status() {
@@ -148,6 +200,8 @@ cmd_stop() {
 
     echo "==> Stopping $container on $SERVER..."
     ssh_cmd "docker stop $container 2>/dev/null" || echo "Container not running."
+    gcp_stop_refresher "$session"
+    ssh_cmd "rm -rf /tmp/cs-gcp-$session" || true
     # Also kill tmux session if it exists
     ssh_cmd "tmux kill-session -t cs-$session 2>/dev/null" || true
 }
@@ -184,7 +238,8 @@ cmd_cleanup() {
 
     echo "==> Cleaning up session $session..."
     ssh_cmd "docker stop $container 2>/dev/null; docker rm $container 2>/dev/null" || true
-    ssh_cmd "rm -rf ~/$REMOTE_BASE/$session /tmp/cs-ssh-$session /tmp/cs-azure-$session /tmp/cs-expo-$session /tmp/cs-infisical-$session /tmp/cs-gh-$session" || true
+    ssh_cmd "rm -rf ~/$REMOTE_BASE/$session /tmp/cs-ssh-$session /tmp/cs-azure-$session /tmp/cs-expo-$session /tmp/cs-infisical-$session /tmp/cs-gh-$session /tmp/cs-gcp-$session" || true
+    gcp_stop_refresher "$session"
     ssh_cmd "tmux kill-session -t cs-$session 2>/dev/null" || true
     rm -f "$LOCAL_META_DIR/$session"
     echo "==> Cleaned up."
@@ -211,7 +266,13 @@ cmd_cleanup_all() {
     # Remove all workspaces (but not .build/)
     ssh_cmd "find ~/$REMOTE_BASE -maxdepth 1 -mindepth 1 -type d ! -name '.build' -exec rm -rf {} +" || true
     # Remove all temp credential dirs
-    ssh_cmd "rm -rf /tmp/cs-ssh-* /tmp/cs-azure-* /tmp/cs-expo-* /tmp/cs-infisical-* /tmp/cs-gh-*" || true
+    ssh_cmd "rm -rf /tmp/cs-ssh-* /tmp/cs-azure-* /tmp/cs-expo-* /tmp/cs-infisical-* /tmp/cs-gh-* /tmp/cs-gcp-*" || true
+    # Stop local GCP token refreshers
+    for pidfile in "$GCP_PID_DIR"/*.pid; do
+        [[ -f "$pidfile" ]] || continue
+        kill "$(cat "$pidfile")" 2>/dev/null || true
+        rm -f "$pidfile"
+    done
     # Remove local metadata
     rm -rf "$LOCAL_META_DIR"
     mkdir -p "$LOCAL_META_DIR"
@@ -375,6 +436,8 @@ MOUNT_AZURE=false
 MOUNT_EXPO=false
 MOUNT_INFISICAL=true
 MOUNT_GITHUB=false
+GCP_SA="${CLAUDE_SAFE_GCP_SA:-}"
+GCP_PROJECT="${CLAUDE_SAFE_GCP_PROJECT:-}"
 FOLLOW=false
 EXTRA_ARGS=()
 CLAUDE_ARGS=()
@@ -394,6 +457,8 @@ while [[ $# -gt 0 ]]; do
         --expo)        MOUNT_EXPO=true; shift ;;
         --no-infisical) MOUNT_INFISICAL=false; shift ;;
         --github)      MOUNT_GITHUB=true; shift ;;
+        --gcp-sa)      GCP_SA="$2"; shift 2 ;;
+        --gcp-project) GCP_PROJECT="$2"; shift 2 ;;
         --follow)      FOLLOW=true; shift ;;
         --server)      SERVER="$2"; shift 2 ;;
         -p|--print)    CLAUDE_ARGS+=("$1" "$2"); shift 2 ;;
@@ -429,6 +494,10 @@ while [[ $# -gt 0 ]]; do
             echo "  --expo              Copy ~/.expo to server for container"
             echo "  --no-infisical      Skip copying ~/.infisical (copied by default)"
             echo "  --github            Extract and pass GH_TOKEN"
+            echo "  --gcp-sa EMAIL      Impersonate GCP service account; push a 1h access token to"
+            echo "                        the server, refreshed from this machine every 50 min"
+            echo "                        while it is awake. Env: CLAUDE_SAFE_GCP_SA"
+            echo "  --gcp-project P     Set gcloud project in container (default: host gcloud config)"
             echo "  -p 'prompt'         Non-interactive build (primary use case)"
             echo "  -h, --help          Show this help"
             echo ""
@@ -810,6 +879,24 @@ if $MOUNT_GITHUB; then
     fi
 fi
 
+REMOTE_GCP_DIR=""
+if [[ -n "$GCP_SA" ]]; then
+    if ! command -v gcloud >/dev/null 2>&1; then
+        echo "ERROR: --gcp-sa needs gcloud on this machine (brew install --cask google-cloud-sdk)" >&2
+        exit 1
+    fi
+    REMOTE_GCP_DIR="/tmp/cs-gcp-$SESSION_ID"
+    if ! gcp_push_token "$GCP_SA" "$SERVER" "$REMOTE_GCP_DIR"; then
+        echo "ERROR: could not mint/push token for $GCP_SA." >&2
+        echo "  Check: gcloud auth login, and that you have roles/iam.serviceAccountTokenCreator on the SA." >&2
+        exit 1
+    fi
+    if [[ -z "$GCP_PROJECT" ]]; then
+        GCP_PROJECT=$(gcloud config get-value project 2>/dev/null || true)
+    fi
+    echo "==> GCP token pushed to server ($GCP_SA)"
+fi
+
 # ── Generate entrypoint script ────────────────────────────────────
 ENTRYPOINT_LINES=()
 ENTRYPOINT_LINES+=('#!/bin/bash')
@@ -918,6 +1005,17 @@ if [[ -n "${INFISICAL_DOMAIN:-}" ]]; then
     DOCKER_LINES+=("    -e \"INFISICAL_DOMAIN=$INFISICAL_DOMAIN\" \\")
 fi
 
+# GCP short-lived token (--gcp-sa)
+if [[ -n "$REMOTE_GCP_DIR" ]]; then
+    DOCKER_LINES+=("    -v \"$REMOTE_GCP_DIR:/run/gcp:ro\" \\")
+    DOCKER_LINES+=("    -e \"CLOUDSDK_AUTH_ACCESS_TOKEN_FILE=/run/gcp/token\" \\")
+    DOCKER_LINES+=("    -e \"GCP_SERVICE_ACCOUNT=$GCP_SA\" \\")
+    if [[ -n "$GCP_PROJECT" ]]; then
+        DOCKER_LINES+=("    -e \"CLOUDSDK_CORE_PROJECT=$GCP_PROJECT\" \\")
+        DOCKER_LINES+=("    -e \"GOOGLE_CLOUD_PROJECT=$GCP_PROJECT\" \\")
+    fi
+fi
+
 # SSH mount
 if [[ -n "$REMOTE_SSH_DIR" ]]; then
     DOCKER_LINES+=("    -v \"$REMOTE_SSH_DIR:/home/node/.ssh:ro\" \\")
@@ -998,8 +1096,22 @@ if [[ -n "$REMOTE_SSH_DIR" ]]; then
 else
     echo "==> SSH:         false"
 fi
+if [[ -n "$GCP_SA" ]]; then
+    echo "==> GCP:         $GCP_SA (refreshed from this machine every $((GCP_REFRESH_AFTER / 60)) min)${GCP_PROJECT:+, project $GCP_PROJECT}"
+fi
 echo "==> Firewall:    $FIREWALL"
 echo ""
+
+# Start the GCP token refresher before launch. Detached (nohup-style, own
+# stdio) so it survives this script exiting in -p mode and never writes to
+# the tmux/Claude terminal.
+if [[ -n "$REMOTE_GCP_DIR" ]]; then
+    mkdir -p "$GCP_PID_DIR"
+    gcp_refresher "$GCP_SA" "$SERVER" "$REMOTE_GCP_DIR" "$CONTAINER_NAME" "$GCP_PID_DIR/$SESSION_ID.pid" \
+        </dev/null >/dev/null 2>&1 &
+    echo $! > "$GCP_PID_DIR/$SESSION_ID.pid"
+    disown
+fi
 
 # ── Launch ────────────────────────────────────────────────────────
 if $INTERACTIVE || $SHELL_MODE; then

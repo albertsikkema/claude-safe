@@ -55,6 +55,33 @@ else
     done
 fi
 
+# ── Google: Fetch official CIDR ranges ───────────────────────────────
+# goog.json lists every Google-owned range; only IPv4 is used (no ip6tables).
+# Covers all *.googleapis.com hosts, which DNS-at-startup cannot track
+# reliably because Google rotates frontend IPs per lookup.
+# NOTE: this also includes Google Cloud customer ranges (cloud.json), so
+# traffic to arbitrary GCP-hosted endpoints on 80/443 is allowed.
+echo "    Fetching Google IP ranges..."
+GOOG_JSON=$(curl -s --max-time 10 https://www.gstatic.com/ipranges/goog.json 2>/dev/null || echo "{}")
+GOOG_CIDRS=$(echo "$GOOG_JSON" | jq -r '.prefixes[]?.ipv4Prefix // empty' 2>/dev/null \
+    | sort -u | aggregate -q 2>/dev/null || true)
+
+if [[ -n "$GOOG_CIDRS" ]]; then
+    for cidr in $GOOG_CIDRS; do
+        ipset add allowed-ips "$cidr" 2>/dev/null || true
+    done
+    echo "    Added $(echo "$GOOG_CIDRS" | wc -w | tr -d ' ') Google CIDR ranges"
+else
+    echo "    WARNING: Could not fetch Google IP ranges, falling back to DNS"
+    for domain in accounts.google.com oauth2.googleapis.com sts.googleapis.com \
+                  iamcredentials.googleapis.com www.googleapis.com \
+                  cloudresourcemanager.googleapis.com storage.googleapis.com; do
+        for ip in $(dig +short "$domain" 2>/dev/null | grep -E '^[0-9]+\.' || true); do
+            ipset add allowed-ips "$ip" 2>/dev/null || true
+        done
+    done
+fi
+
 # ── Other domains: Resolve via DNS ───────────────────────────────────
 ALLOWED_DOMAINS=(
     # Anthropic / Claude

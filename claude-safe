@@ -11,6 +11,7 @@
 #   claude-safe --azure             # mount ~/.azure for Azure CLI credentials
 #   claude-safe --expo              # mount ~/.expo for EAS CLI credentials
 #   claude-safe --no-infisical      # skip mounting ~/.infisical
+#   claude-safe --gcp-sa SA_EMAIL   # inject short-lived GCP token (auto-refreshed)
 #   claude-safe --rebuild           # full image rebuild (--no-cache)
 #   claude-safe --pull              # pull latest nightly image from GHCR and retag
 #   claude-safe -p "prompt"         # non-interactive mode with prompt
@@ -56,6 +57,10 @@ MOUNT_EXPO=false
 MOUNT_INFISICAL=true
 MOUNT_GITHUB=false
 MOUNT_LOGBENCH=true
+GCP_SA="${CLAUDE_SAFE_GCP_SA:-}"          # service account to impersonate (--gcp-sa)
+GCP_PROJECT="${CLAUDE_SAFE_GCP_PROJECT:-}" # project for gcloud in container (--gcp-project)
+GCP_TOKEN_DIR=""                           # host dir holding the token file (mounted ro)
+GCP_REFRESH_AFTER=3000                     # impersonated tokens live 1h; refresh at 50 min
 # By default, hide host .venv and node_modules from the container by overlaying
 # them with empty tmpfs mounts. Reasoning: .venv built on macOS contains mach-o
 # binaries that the Linux container can't execute, and node_modules with native
@@ -84,6 +89,8 @@ while [[ $# -gt 0 ]]; do
         --expo)        MOUNT_EXPO=true; shift ;;
         --no-infisical) MOUNT_INFISICAL=false; shift ;;
         --github)      MOUNT_GITHUB=true; shift ;;
+        --gcp-sa)      GCP_SA="$2"; shift 2 ;;
+        --gcp-project) GCP_PROJECT="$2"; shift 2 ;;
         --no-logbench) MOUNT_LOGBENCH=false; shift ;;
         --keep-venv)   KEEP_VENV=true; shift ;;
         -p|--print)    CLAUDE_ARGS+=("$1" "$2"); shift 2 ;;
@@ -109,6 +116,10 @@ while [[ $# -gt 0 ]]; do
             echo "  --expo          Mount ~/.expo for EAS CLI credentials"
             echo "  --no-infisical  Skip mounting ~/.infisical (mounted by default)"
             echo "  --github        Mount ~/.config/gh and extract host GitHub token (full repo access)"
+            echo "  --gcp-sa EMAIL  Impersonate GCP service account; inject a 1h access token"
+            echo "                    refreshed on the host every 50 min (needs host gcloud +"
+            echo "                    roles/iam.serviceAccountTokenCreator). Env: CLAUDE_SAFE_GCP_SA"
+            echo "  --gcp-project P Set gcloud project in container (default: host gcloud config)"
             echo "  --no-logbench   Skip mounting logbench binary + config (mounted by default)"
             echo "  --keep-venv     Expose host .venv/ and node_modules/ to the container"
             echo "                    (default: hidden so the container can't clobber host artifacts)"
@@ -187,6 +198,40 @@ cleanup() {
     fi
 }
 trap cleanup EXIT
+
+# ── GCP token helpers (--gcp-sa) ──────────────────────────────────
+# Mint an impersonated access token and atomically replace <dir>/token.
+# Writes to a temp file + mv so the container never reads a half-written token.
+# The directory (not the file) is bind-mounted, so the rename is visible inside.
+gcp_write_token() {
+    local sa="$1" dir="$2" tok
+    tok=$(gcloud auth print-access-token --impersonate-service-account="$sa" 2>/dev/null) || return 1
+    [[ -n "$tok" ]] || return 1
+    ( umask 077; printf '%s' "$tok" > "$dir/token.tmp" ) && mv -f "$dir/token.tmp" "$dir/token"
+    date -u +%Y-%m-%dT%H:%M:%SZ > "$dir/refreshed_at"
+}
+
+# Background refresher. Runs until <watch_pid> exits (the wrapper exec's into
+# docker, so this PID is the container's lifetime), then deletes the token dir.
+# Polls every 60s against wall-clock time instead of sleeping 50 min, so a
+# laptop that wakes from sleep refreshes within a minute.
+gcp_refresher() {
+    local sa="$1" dir="$2" watch_pid="$3" last now
+    trap '' HUP   # survive the launching terminal closing
+    last=$(date +%s)
+    while kill -0 "$watch_pid" 2>/dev/null; do
+        sleep 60
+        now=$(date +%s)
+        if (( now - last >= GCP_REFRESH_AFTER )); then
+            if gcp_write_token "$sa" "$dir"; then
+                last=$now
+            else
+                echo "$(date -u +%FT%TZ) refresh failed; retrying in 60s" >> "$dir/refresh.log"
+            fi
+        fi
+    done
+    rm -rf "$dir"
+}
 
 # ── Auto-check GHCR for newer image (once per day, fail-open) ─────
 check_remote_image_age() {
@@ -788,6 +833,36 @@ if [[ -n "${INFISICAL_DOMAIN:-}" ]]; then
     CMD+=(-e "INFISICAL_DOMAIN=$INFISICAL_DOMAIN")
 fi
 
+# GCP service account (--gcp-sa): short-lived token via impersonation.
+# The host mints a 1h access token and writes it to a file in a private temp
+# dir, mounted read-only at /run/gcp. gcloud in the container reads it on every
+# invocation (CLOUDSDK_AUTH_ACCESS_TOKEN_FILE), so a background refresher on
+# the host can swap in a new token without restarting the container. No key
+# file or refresh token ever enters the container.
+if [[ -n "$GCP_SA" ]]; then
+    if ! command -v gcloud >/dev/null 2>&1; then
+        echo "ERROR: --gcp-sa needs gcloud on the host (brew install --cask google-cloud-sdk)" >&2
+        exit 1
+    fi
+    GCP_TOKEN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/claude-safe-gcp.XXXXXX")
+    chmod 700 "$GCP_TOKEN_DIR"
+    if ! gcp_write_token "$GCP_SA" "$GCP_TOKEN_DIR"; then
+        rm -rf "$GCP_TOKEN_DIR"
+        echo "ERROR: could not mint token for $GCP_SA." >&2
+        echo "  Check: gcloud auth login, and that you have roles/iam.serviceAccountTokenCreator on the SA." >&2
+        exit 1
+    fi
+    if [[ -z "$GCP_PROJECT" ]]; then
+        GCP_PROJECT=$(gcloud config get-value project 2>/dev/null || true)
+    fi
+    CMD+=(-v "$GCP_TOKEN_DIR:/run/gcp:ro")
+    CMD+=(-e "CLOUDSDK_AUTH_ACCESS_TOKEN_FILE=/run/gcp/token")
+    CMD+=(-e "GCP_SERVICE_ACCOUNT=$GCP_SA")
+    if [[ -n "$GCP_PROJECT" ]]; then
+        CMD+=(-e "CLOUDSDK_CORE_PROJECT=$GCP_PROJECT" -e "GOOGLE_CLOUD_PROJECT=$GCP_PROJECT")
+    fi
+fi
+
 # Optionally mount selected SSH server config + keys (--ssh flag, read-only)
 if $MOUNT_SSH; then
     CMD+=(-v "$SSH_TMPDIR:/home/node/.ssh:ro")
@@ -934,6 +1009,11 @@ fi
 echo "==> Azure:     $MOUNT_AZURE"
 echo "==> Expo:      $MOUNT_EXPO"
 echo "==> Infisical: $MOUNT_INFISICAL"
+if [[ -n "$GCP_SA" ]]; then
+    echo "==> GCP:       $GCP_SA (token refreshed every $((GCP_REFRESH_AFTER / 60)) min)${GCP_PROJECT:+, project $GCP_PROJECT}"
+else
+    echo "==> GCP:       false"
+fi
 if $KEEP_VENV; then
     echo "==> Venv mask: off (host .venv and node_modules visible — --keep-venv)"
 else
@@ -950,5 +1030,13 @@ echo "==> Timezone:  $HOST_TZ ($(TZ=$HOST_TZ date '+%Y-%m-%d %H:%M'))"
 echo "==> Firewall:  $FIREWALL"
 echo "==> Container: $CONTAINER_NAME"
 echo ""
+
+# Start the token refresher detached from the terminal so its output never
+# interleaves with the Claude TUI. It watches $$, which becomes the docker
+# process after exec, and cleans up the token dir when the container exits.
+if [[ -n "$GCP_TOKEN_DIR" ]]; then
+    gcp_refresher "$GCP_SA" "$GCP_TOKEN_DIR" "$$" </dev/null >/dev/null 2>&1 &
+    disown
+fi
 
 exec "${CMD[@]}"

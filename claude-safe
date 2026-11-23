@@ -953,6 +953,7 @@ echo "==> Container: $CONTAINER_NAME"
 echo ""
 
 # Not exec: bash must outlive docker so the EXIT trap removes SSH_TMPDIR.
+# A SIGTERM sent only to this PID leaves docker running; that is intended.
 rc=0
 "${CMD[@]}" || rc=$?
 exit "$rc"

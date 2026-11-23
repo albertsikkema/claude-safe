@@ -181,6 +181,7 @@ PROJECT_NAME=$(basename "$PROJECT_DIR" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-
 CONTAINER_NAME="claude-${PROJECT_NAME}-$$"
 
 # ── Cleanup ───────────────────────────────────────────────────────
+# shellcheck disable=SC2329  # invoked via trap
 cleanup() {
     if [[ -n "$SSH_TMPDIR" && -d "$SSH_TMPDIR" ]]; then
         rm -rf "$SSH_TMPDIR"
@@ -951,4 +952,8 @@ echo "==> Firewall:  $FIREWALL"
 echo "==> Container: $CONTAINER_NAME"
 echo ""
 
-exec "${CMD[@]}"
+# Not exec: bash must outlive docker so the EXIT trap removes SSH_TMPDIR.
+# A SIGTERM sent only to this PID leaves docker running; that is intended.
+rc=0
+"${CMD[@]}" || rc=$?
+exit "$rc"
